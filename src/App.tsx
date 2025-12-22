@@ -1,7 +1,7 @@
 // ABOUTME: PingZilla React frontend - displays ping graph and current latency
 // ABOUTME: Listens to Tauri events for real-time updates
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -13,6 +13,52 @@ import {
   ReferenceLine,
 } from "recharts";
 import "./App.css";
+
+// Animated number component for smooth transitions
+function AnimatedNumber({ value, duration = 300 }: { value: number | null; duration?: number }) {
+  const [displayValue, setDisplayValue] = useState(value);
+  const animationRef = useRef<number | undefined>(undefined);
+  const startTimeRef = useRef<number | undefined>(undefined);
+  const startValueRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (value === null) {
+      setDisplayValue(null);
+      return;
+    }
+
+    const startValue = displayValue ?? value;
+    startValueRef.current = startValue;
+    startTimeRef.current = performance.now();
+
+    const animate = (currentTime: number) => {
+      const elapsed = currentTime - (startTimeRef.current ?? currentTime);
+      const progress = Math.min(elapsed / duration, 1);
+
+      // Ease out cubic for smooth deceleration
+      const easeOut = 1 - Math.pow(1 - progress, 3);
+
+      const start = startValueRef.current ?? value;
+      const current = start + (value - start) * easeOut;
+
+      setDisplayValue(Math.round(current));
+
+      if (progress < 1) {
+        animationRef.current = requestAnimationFrame(animate);
+      }
+    };
+
+    animationRef.current = requestAnimationFrame(animate);
+
+    return () => {
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
+    };
+  }, [value, duration]);
+
+  return <>{displayValue !== null ? displayValue : "---"}</>;
+}
 
 interface PingResult {
   timestamp: string;
@@ -29,7 +75,7 @@ function App() {
   const [currentPing, setCurrentPing] = useState<number | null>(null);
   const [history, setHistory] = useState<ChartData[]>([]);
   const [target, setTarget] = useState("8.8.8.8");
-  const [threshold, setThreshold] = useState(200);
+  const [threshold, setThreshold] = useState(400);
   const [showSettings, setShowSettings] = useState(false);
 
   // Load initial data and settings
@@ -147,7 +193,7 @@ function App() {
             <input
               type="number"
               value={threshold}
-              onChange={(e) => setThreshold(parseInt(e.target.value) || 200)}
+              onChange={(e) => setThreshold(parseInt(e.target.value) || 400)}
               min={50}
               max={1000}
             />
@@ -165,7 +211,7 @@ function App() {
           className="ping-value"
           style={{ color: getPingColor(currentPing) }}
         >
-          {currentPing !== null ? `${Math.round(currentPing)}` : "---"}
+          <AnimatedNumber value={currentPing !== null ? Math.round(currentPing) : null} duration={400} />
           <span className="ping-unit">ms</span>
         </div>
         <div

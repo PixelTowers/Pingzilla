@@ -4,10 +4,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use surge_ping::{Client, Config, PingIdentifier, PingSequence};
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
@@ -38,7 +36,7 @@ impl Default for AppState {
         Self {
             ping_history: Mutex::new(VecDeque::with_capacity(1000)),
             ping_target: Mutex::new("8.8.8.8".to_string()),
-            notification_threshold_ms: Mutex::new(200),
+            notification_threshold_ms: Mutex::new(400),
             last_notification: Mutex::new(None),
         }
     }
@@ -85,36 +83,34 @@ async fn get_settings(state: State<'_, Arc<AppState>>) -> Result<(String, u32), 
     Ok((target, threshold))
 }
 
-/// Perform a single ping
+/// Perform a single ping using system ping command (no root needed)
 async fn do_ping(target: &str) -> Option<f64> {
-    let addr: IpAddr = match target.parse() {
-        Ok(addr) => addr,
-        Err(_) => {
-            use std::net::ToSocketAddrs;
-            match format!("{}:0", target).to_socket_addrs() {
-                Ok(mut addrs) => match addrs.next() {
-                    Some(addr) => addr.ip(),
-                    None => return None,
-                },
-                Err(_) => return None,
+    use std::process::Command;
+
+    let output = Command::new("ping")
+        .args(["-c", "1", "-W", "2000", target])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Parse "time=12.345 ms" from output
+    for line in stdout.lines() {
+        if let Some(time_idx) = line.find("time=") {
+            let time_str = &line[time_idx + 5..];
+            if let Some(ms_idx) = time_str.find(" ms") {
+                if let Ok(ms) = time_str[..ms_idx].parse::<f64>() {
+                    return Some(ms);
+                }
             }
         }
-    };
-
-    let config = Config::default();
-    let client = match Client::new(&config) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-
-    let payload = [0; 56];
-    let mut pinger = client.pinger(addr, PingIdentifier(rand::random())).await;
-    pinger.timeout(Duration::from_secs(2));
-
-    match pinger.ping(PingSequence(0), &payload).await {
-        Ok((_, duration)) => Some(duration.as_secs_f64() * 1000.0),
-        Err(_) => None,
     }
+
+    None
 }
 
 /// Start the ping service background task
@@ -215,20 +211,38 @@ fn load_history() -> VecDeque<PingResult> {
 
 /// Position window below tray icon (macOS)
 fn position_window_at_tray(window: &tauri::WebviewWindow, tray_rect: tauri::Rect) {
+    let scale = window.scale_factor().unwrap_or(2.0);
+
+    // Get window size in logical pixels
     let window_size = window.outer_size().unwrap_or(tauri::PhysicalSize {
         width: 320,
         height: 400,
     });
+    let window_width = (window_size.width as f64 / scale) as i32;
 
-    // Use to_logical to get the position values
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let pos = tray_rect.position.to_logical::<i32>(scale);
-    let size = tray_rect.size.to_logical::<u32>(scale);
+    // Get tray position - the rect gives us physical coordinates
+    let tray_x = match tray_rect.position {
+        tauri::Position::Physical(p) => (p.x as f64 / scale) as i32,
+        tauri::Position::Logical(l) => l.x as i32,
+    };
+    let tray_y = match tray_rect.position {
+        tauri::Position::Physical(p) => (p.y as f64 / scale) as i32,
+        tauri::Position::Logical(l) => l.y as i32,
+    };
+    let tray_width = match tray_rect.size {
+        tauri::Size::Physical(p) => (p.width as f64 / scale) as i32,
+        tauri::Size::Logical(l) => l.width as i32,
+    };
+    let tray_height = match tray_rect.size {
+        tauri::Size::Physical(p) => (p.height as f64 / scale) as i32,
+        tauri::Size::Logical(l) => l.height as i32,
+    };
 
-    let x = pos.x + (size.width as i32 / 2) - (window_size.width as i32 / 2);
-    let y = pos.y + size.height as i32 + 5;
+    // Center window under tray icon
+    let x = tray_x + (tray_width / 2) - (window_width / 2);
+    let y = tray_y + tray_height + 5;
 
-    let _ = window.set_position(tauri::PhysicalPosition { x, y });
+    let _ = window.set_position(tauri::LogicalPosition::new(x, y));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -253,14 +267,11 @@ pub fn run() {
         ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
-            {
-                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-            }
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let quit = MenuItem::with_id(app, "quit", "Quit PingZilla", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&quit])?;
 
-            // Load icon from embedded bytes
             let icon_bytes = include_bytes!("../icons/32x32.png");
             let icon = Image::from_bytes(icon_bytes)?;
 
@@ -268,43 +279,38 @@ pub fn run() {
                 .icon(icon)
                 .icon_as_template(true)
                 .title("...")
-                .tooltip("PingZilla - Network Monitor")
+                .tooltip("PingZilla - Network Monitor (Right-click to quit)")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_tray_icon_event(|tray, event| {
                     let app = tray.app_handle();
 
-                    match event {
-                        TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            rect,
-                            ..
-                        } => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                if window.is_visible().unwrap_or(false) {
-                                    let _ = window.hide();
-                                } else {
-                                    position_window_at_tray(&window, rect);
-                                    let _ = window.show();
-                                    let _ = window.set_focus();
-                                }
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        rect,
+                        ..
+                    } = event
+                    {
+                        if let Some(window) = app.get_webview_window("main") {
+                            if window.is_visible().unwrap_or(false) {
+                                let _ = window.hide();
+                            } else {
+                                position_window_at_tray(&window, rect);
+                                let _ = window.show();
+                                let _ = window.set_focus();
                             }
                         }
-                        _ => {}
                     }
                 })
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "quit" => {
+                .on_menu_event(|app, event| {
+                    if event.id.as_ref() == "quit" {
                         app.exit(0);
                     }
-                    _ => {}
                 })
                 .build(app)?;
 
-            let handle = app.handle().clone();
-            let state = app_state.clone();
-            start_ping_service(handle, state);
+            start_ping_service(app.handle().clone(), app_state.clone());
 
             Ok(())
         })
