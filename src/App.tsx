@@ -4,6 +4,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import {
   LineChart,
   Line,
@@ -77,6 +78,7 @@ function App() {
   const [target, setTarget] = useState("8.8.8.8");
   const [threshold, setThreshold] = useState(400);
   const [showSettings, setShowSettings] = useState(false);
+  const [launchAtLogin, setLaunchAtLogin] = useState(false);
 
   // Load initial data and settings
   useEffect(() => {
@@ -85,6 +87,9 @@ function App() {
         const [loadedTarget, loadedThreshold] = await invoke<[string, number]>("get_settings");
         setTarget(loadedTarget);
         setThreshold(loadedThreshold);
+
+        const autoStartEnabled = await isEnabled();
+        setLaunchAtLogin(autoStartEnabled);
 
         const pingHistory = await invoke<PingResult[]>("get_ping_history");
         const chartData = pingHistory.slice(-60).map((p) => ({
@@ -148,6 +153,20 @@ function App() {
     }
   }, [target, threshold]);
 
+  const toggleLaunchAtLogin = useCallback(async () => {
+    try {
+      if (launchAtLogin) {
+        await disable();
+        setLaunchAtLogin(false);
+      } else {
+        await enable();
+        setLaunchAtLogin(true);
+      }
+    } catch (e) {
+      console.error("Failed to toggle launch at login:", e);
+    }
+  }, [launchAtLogin]);
+
   // Determine ping color based on latency
   const getPingColor = (ms: number | null): string => {
     if (ms === null) return "#888";
@@ -198,6 +217,15 @@ function App() {
               max={1000}
             />
             <span>ms</span>
+          </div>
+          <div className="setting-row">
+            <label>Launch at login:</label>
+            <button
+              className={`toggle-btn ${launchAtLogin ? "active" : ""}`}
+              onClick={toggleLaunchAtLogin}
+            >
+              {launchAtLogin ? "On" : "Off"}
+            </button>
           </div>
           <button className="save-btn" onClick={saveSettings}>
             Save

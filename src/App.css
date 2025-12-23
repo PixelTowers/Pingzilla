@@ -112,6 +112,32 @@ body {
   background: #2563eb;
 }
 
+.toggle-btn {
+  background: #333;
+  border: 1px solid #444;
+  color: #888;
+  padding: 6px 16px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  min-width: 50px;
+}
+
+.toggle-btn:hover {
+  background: #444;
+}
+
+.toggle-btn.active {
+  background: #22c55e;
+  border-color: #22c55e;
+  color: #fff;
+}
+
+.toggle-btn.active:hover {
+  background: #16a34a;
+}
+
 /* Current Ping Display */
 .current-ping {
   text-align: center;
