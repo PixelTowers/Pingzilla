@@ -95,6 +95,22 @@ body {
   color: #888;
 }
 
+.display-mode-select {
+  flex: 1;
+  background: #333;
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 6px 8px;
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.display-mode-select:focus {
+  outline: none;
+  border-color: #3b82f6;
+}
+
 .save-btn {
   width: 100%;
   background: #3b82f6;
@@ -138,14 +154,192 @@ body {
   background: #16a34a;
 }
 
+/* Target Tabs */
+.tabs-container {
+  margin-bottom: 8px;
+  overflow-x: auto;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #252525;
+  border: 1px solid #333;
+  border-radius: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.tab:hover {
+  background: #333;
+  border-color: #444;
+}
+
+.tab.active {
+  background: #333;
+  border-color: #3b82f6;
+}
+
+.tab-name {
+  font-size: 11px;
+  color: #ccc;
+  max-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab.active .tab-name {
+  color: #fff;
+}
+
+.tab-ping {
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.tab-close {
+  background: none;
+  border: none;
+  color: #666;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+  transition: color 0.15s ease;
+}
+
+.tab-close:hover {
+  color: #ef4444;
+}
+
+.tab-add {
+  background: #252525;
+  border: 1px dashed #444;
+  border-radius: 6px;
+  color: #666;
+  font-size: 16px;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.tab-add:hover {
+  background: #333;
+  border-color: #3b82f6;
+  color: #3b82f6;
+}
+
+/* Add Target Panel */
+.add-target-panel {
+  background: #252525;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 8px;
+}
+
+.add-target-panel input {
+  width: 100%;
+  background: #333;
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 8px;
+  color: #fff;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.add-target-panel input:focus {
+  outline: none;
+  border-color: #3b82f6;
+}
+
+.add-target-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.cancel-btn {
+  flex: 1;
+  background: #333;
+  border: 1px solid #444;
+  color: #888;
+  padding: 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.cancel-btn:hover {
+  background: #444;
+  color: #fff;
+}
+
+/* Statistics Row */
+.stats-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #252525;
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.stat-label {
+  font-size: 9px;
+  color: #666;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.stat-value {
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+}
+
+.stats-period {
+  background: #333;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #888;
+  font-size: 10px;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+
+.stats-period:focus {
+  outline: none;
+  border-color: #3b82f6;
+}
+
 /* Current Ping Display */
 .current-ping {
   text-align: center;
-  padding: 16px 0;
+  padding: 8px 0;
 }
 
 .ping-value {
-  font-size: 56px;
+  font-size: 48px;
   font-weight: 700;
   line-height: 1;
   letter-spacing: -2px;

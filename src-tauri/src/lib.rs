@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{
@@ -24,44 +24,130 @@ pub struct PingResult {
     pub target: String,
 }
 
+/// Statistics for a target
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PingStatistics {
+    pub min_ms: Option<f64>,
+    pub max_ms: Option<f64>,
+    pub avg_ms: Option<f64>,
+    pub packet_loss_pct: f64,
+    pub total_pings: usize,
+    pub failed_pings: usize,
+}
+
+/// Menu bar display mode
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum DisplayMode {
+    IconOnly,
+    IconAndPing,
+    PingOnly,
+}
+
 /// Application state shared across the app
 pub struct AppState {
-    pub ping_history: Mutex<VecDeque<PingResult>>,
-    pub ping_target: Mutex<String>,
+    pub ping_history: Mutex<HashMap<String, VecDeque<PingResult>>>,
+    pub targets: Mutex<Vec<String>>,
+    pub primary_target: Mutex<String>,
     pub notification_threshold_ms: Mutex<u32>,
     pub last_notification: Mutex<Option<DateTime<Utc>>>,
+    pub display_mode: Mutex<DisplayMode>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        let mut history = HashMap::new();
+        history.insert("8.8.8.8".to_string(), VecDeque::with_capacity(1000));
         Self {
-            ping_history: Mutex::new(VecDeque::with_capacity(1000)),
-            ping_target: Mutex::new("8.8.8.8".to_string()),
+            ping_history: Mutex::new(history),
+            targets: Mutex::new(vec!["8.8.8.8".to_string()]),
+            primary_target: Mutex::new("8.8.8.8".to_string()),
             notification_threshold_ms: Mutex::new(400),
             last_notification: Mutex::new(None),
+            display_mode: Mutex::new(DisplayMode::IconAndPing),
         }
     }
 }
 
-/// Get current ping value
+/// Get current ping value for a target (defaults to primary)
 #[tauri::command]
-async fn get_current_ping(state: State<'_, Arc<AppState>>) -> Result<Option<PingResult>, String> {
+async fn get_current_ping(
+    target: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<PingResult>, String> {
+    let target = match target {
+        Some(t) => t,
+        None => state.primary_target.lock().await.clone(),
+    };
     let history = state.ping_history.lock().await;
-    Ok(history.back().cloned())
+    Ok(history.get(&target).and_then(|h| h.back().cloned()))
 }
 
-/// Get ping history
+/// Get ping history for a target (defaults to primary)
 #[tauri::command]
-async fn get_ping_history(state: State<'_, Arc<AppState>>) -> Result<Vec<PingResult>, String> {
+async fn get_ping_history(
+    target: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<PingResult>, String> {
+    let target = match target {
+        Some(t) => t,
+        None => state.primary_target.lock().await.clone(),
+    };
     let history = state.ping_history.lock().await;
-    Ok(history.iter().cloned().collect())
+    Ok(history
+        .get(&target)
+        .map(|h| h.iter().cloned().collect())
+        .unwrap_or_default())
 }
 
-/// Set ping target
+/// Get all targets
 #[tauri::command]
-async fn set_ping_target(target: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let mut ping_target = state.ping_target.lock().await;
-    *ping_target = target;
+async fn get_targets(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
+    let targets = state.targets.lock().await;
+    Ok(targets.clone())
+}
+
+/// Add a new target
+#[tauri::command]
+async fn add_target(target: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let mut targets = state.targets.lock().await;
+    if !targets.contains(&target) {
+        targets.push(target.clone());
+        let mut history = state.ping_history.lock().await;
+        history.insert(target, VecDeque::with_capacity(1000));
+    }
+    Ok(())
+}
+
+/// Remove a target
+#[tauri::command]
+async fn remove_target(target: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let mut targets = state.targets.lock().await;
+    if targets.len() <= 1 {
+        return Err("Cannot remove the last target".to_string());
+    }
+    targets.retain(|t| t != &target);
+
+    let mut history = state.ping_history.lock().await;
+    history.remove(&target);
+
+    let mut primary = state.primary_target.lock().await;
+    if *primary == target {
+        *primary = targets.first().cloned().unwrap_or_default();
+    }
+    Ok(())
+}
+
+/// Set primary target (shown in tray)
+#[tauri::command]
+async fn set_primary_target(target: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let targets = state.targets.lock().await;
+    if !targets.contains(&target) {
+        return Err("Target not found".to_string());
+    }
+    drop(targets);
+
+    let mut primary = state.primary_target.lock().await;
+    *primary = target;
     Ok(())
 }
 
@@ -78,10 +164,135 @@ async fn set_notification_threshold(
 
 /// Get current settings
 #[tauri::command]
-async fn get_settings(state: State<'_, Arc<AppState>>) -> Result<(String, u32), String> {
-    let target = state.ping_target.lock().await.clone();
+async fn get_settings(state: State<'_, Arc<AppState>>) -> Result<(String, u32, String), String> {
+    let target = state.primary_target.lock().await.clone();
     let threshold = *state.notification_threshold_ms.lock().await;
-    Ok((target, threshold))
+    let display_mode = state.display_mode.lock().await.clone();
+    let mode_str = match display_mode {
+        DisplayMode::IconOnly => "icon_only",
+        DisplayMode::IconAndPing => "icon_and_ping",
+        DisplayMode::PingOnly => "ping_only",
+    };
+    Ok((target, threshold, mode_str.to_string()))
+}
+
+/// Set display mode and update tray immediately
+#[tauri::command]
+async fn set_display_mode(
+    mode: String,
+    app_handle: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let display_mode = match mode.as_str() {
+        "icon_only" => DisplayMode::IconOnly,
+        "icon_and_ping" => DisplayMode::IconAndPing,
+        "ping_only" => DisplayMode::PingOnly,
+        _ => return Err("Invalid display mode".to_string()),
+    };
+
+    // Update state
+    {
+        let mut current_mode = state.display_mode.lock().await;
+        *current_mode = display_mode.clone();
+    }
+
+    // Get current ping for primary target to update tray immediately
+    let primary_target = state.primary_target.lock().await.clone();
+    let history = state.ping_history.lock().await;
+    let current_ping = history
+        .get(&primary_target)
+        .and_then(|h| h.back())
+        .and_then(|r| r.latency_ms);
+
+    // Update tray immediately based on display mode
+    if let Some(tray) = app_handle.tray_by_id("main-tray") {
+        let ping_text = match current_ping {
+            Some(ms) => format!("{:.0}ms", ms),
+            None => "---".to_string(),
+        };
+
+        // Load icons for switching
+        let icon_bytes = include_bytes!("../icons/32x32.png");
+        let transparent_bytes = include_bytes!("../icons/transparent.png");
+
+        match display_mode {
+            DisplayMode::IconOnly => {
+                // Show icon, hide text
+                if let Ok(icon) = Image::from_bytes(icon_bytes) {
+                    let _ = tray.set_icon(Some(icon));
+                    let _ = tray.set_icon_as_template(true);
+                }
+                let _ = tray.set_title(Some(""));
+            }
+            DisplayMode::IconAndPing => {
+                // Show both icon and ping text
+                if let Ok(icon) = Image::from_bytes(icon_bytes) {
+                    let _ = tray.set_icon(Some(icon));
+                    let _ = tray.set_icon_as_template(true);
+                }
+                let _ = tray.set_title(Some(&ping_text));
+            }
+            DisplayMode::PingOnly => {
+                // Hide icon, show only ping text
+                if let Ok(icon) = Image::from_bytes(transparent_bytes) {
+                    let _ = tray.set_icon(Some(icon));
+                    let _ = tray.set_icon_as_template(true);
+                }
+                let _ = tray.set_title(Some(&ping_text));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Get statistics for a target over a time period
+#[tauri::command]
+async fn get_statistics(
+    target: Option<String>,
+    minutes: Option<u32>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<PingStatistics, String> {
+    let target = match target {
+        Some(t) => t,
+        None => state.primary_target.lock().await.clone(),
+    };
+    let minutes = minutes.unwrap_or(5);
+    let cutoff = Utc::now() - chrono::Duration::minutes(minutes as i64);
+
+    let history = state.ping_history.lock().await;
+    let pings: Vec<&PingResult> = history
+        .get(&target)
+        .map(|h| h.iter().filter(|p| p.timestamp > cutoff).collect())
+        .unwrap_or_default();
+
+    let total_pings = pings.len();
+    let failed_pings = pings.iter().filter(|p| p.latency_ms.is_none()).count();
+    let successful: Vec<f64> = pings.iter().filter_map(|p| p.latency_ms).collect();
+
+    let (min_ms, max_ms, avg_ms) = if successful.is_empty() {
+        (None, None, None)
+    } else {
+        let min = successful.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = successful.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let avg = successful.iter().sum::<f64>() / successful.len() as f64;
+        (Some(min), Some(max), Some(avg))
+    };
+
+    let packet_loss_pct = if total_pings > 0 {
+        (failed_pings as f64 / total_pings as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(PingStatistics {
+        min_ms,
+        max_ms,
+        avg_ms,
+        packet_loss_pct,
+        total_pings,
+        failed_pings,
+    })
 }
 
 /// Perform a single ping using system ping command (no root needed)
@@ -114,57 +325,103 @@ async fn do_ping(target: &str) -> Option<f64> {
     None
 }
 
-/// Start the ping service background task
+/// Start the ping service background task - pings all targets
 fn start_ping_service(app_handle: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         let mut save_counter = 0u32;
 
         loop {
-            let target = state.ping_target.lock().await.clone();
-            let latency_ms = do_ping(&target).await;
+            let targets = state.targets.lock().await.clone();
+            let primary_target = state.primary_target.lock().await.clone();
 
-            let result = PingResult {
-                timestamp: Utc::now(),
-                latency_ms,
-                target: target.clone(),
-            };
+            for target in &targets {
+                let latency_ms = do_ping(target).await;
 
-            {
-                let mut history = state.ping_history.lock().await;
-                history.push_back(result.clone());
-                while history.len() > 43200 {
-                    history.pop_front();
+                let result = PingResult {
+                    timestamp: Utc::now(),
+                    latency_ms,
+                    target: target.clone(),
+                };
+
+                {
+                    let mut history = state.ping_history.lock().await;
+                    let target_history = history
+                        .entry(target.clone())
+                        .or_insert_with(|| VecDeque::with_capacity(1000));
+                    target_history.push_back(result.clone());
+                    while target_history.len() > 43200 {
+                        target_history.pop_front();
+                    }
                 }
-            }
 
-            let tray_title = match latency_ms {
-                Some(ms) => format!("{:.0}ms", ms),
-                None => "---".to_string(),
-            };
+                // Update tray only for primary target
+                if target == &primary_target {
+                    let display_mode = state.display_mode.lock().await.clone();
 
-            if let Some(tray) = app_handle.tray_by_id("main-tray") {
-                let _ = tray.set_title(Some(&tray_title));
-            }
+                    if let Some(tray) = app_handle.tray_by_id("main-tray") {
+                        let ping_text = match latency_ms {
+                            Some(ms) => format!("{:.0}ms", ms),
+                            None => "---".to_string(),
+                        };
 
-            let _ = app_handle.emit("ping-update", &result);
+                        // Load icons for switching
+                        let icon_bytes = include_bytes!("../icons/32x32.png");
+                        let transparent_bytes = include_bytes!("../icons/transparent.png");
 
-            if let Some(ms) = latency_ms {
-                let threshold = *state.notification_threshold_ms.lock().await;
-                if ms > threshold as f64 {
-                    let mut last_notif = state.last_notification.lock().await;
-                    let should_notify = match *last_notif {
-                        Some(last) => Utc::now().signed_duration_since(last).num_seconds() > 60,
-                        None => true,
-                    };
+                        match display_mode {
+                            DisplayMode::IconOnly => {
+                                // Show icon, hide text
+                                if let Ok(icon) = Image::from_bytes(icon_bytes) {
+                                    let _ = tray.set_icon(Some(icon));
+                                    let _ = tray.set_icon_as_template(true);
+                                }
+                                let _ = tray.set_title(Some(""));
+                            }
+                            DisplayMode::IconAndPing => {
+                                // Show both icon and ping text
+                                if let Ok(icon) = Image::from_bytes(icon_bytes) {
+                                    let _ = tray.set_icon(Some(icon));
+                                    let _ = tray.set_icon_as_template(true);
+                                }
+                                let _ = tray.set_title(Some(&ping_text));
+                            }
+                            DisplayMode::PingOnly => {
+                                // Hide icon, show only ping text
+                                if let Ok(icon) = Image::from_bytes(transparent_bytes) {
+                                    let _ = tray.set_icon(Some(icon));
+                                    let _ = tray.set_icon_as_template(true);
+                                }
+                                let _ = tray.set_title(Some(&ping_text));
+                            }
+                        }
+                    }
+                }
 
-                    if should_notify {
-                        *last_notif = Some(Utc::now());
-                        let _ = app_handle
-                            .notification()
-                            .builder()
-                            .title("PingZilla Alert")
-                            .body(format!("High latency detected: {:.0}ms", ms))
-                            .show();
+                let _ = app_handle.emit("ping-update", &result);
+
+                // Notifications for primary target only
+                if target == &primary_target {
+                    if let Some(ms) = latency_ms {
+                        let threshold = *state.notification_threshold_ms.lock().await;
+                        if ms > threshold as f64 {
+                            let mut last_notif = state.last_notification.lock().await;
+                            let should_notify = match *last_notif {
+                                Some(last) => {
+                                    Utc::now().signed_duration_since(last).num_seconds() > 60
+                                }
+                                None => true,
+                            };
+
+                            if should_notify {
+                                *last_notif = Some(Utc::now());
+                                let _ = app_handle
+                                    .notification()
+                                    .builder()
+                                    .title("PingZilla Alert")
+                                    .body(format!("High latency detected: {:.0}ms", ms))
+                                    .show();
+                            }
+                        }
                     }
                 }
             }
@@ -173,7 +430,9 @@ fn start_ping_service(app_handle: AppHandle, state: Arc<AppState>) {
             if save_counter >= 30 {
                 save_counter = 0;
                 let history = state.ping_history.lock().await;
-                let _ = save_history(&history);
+                let targets = state.targets.lock().await;
+                let primary = state.primary_target.lock().await;
+                let _ = save_history(&history, &targets, &primary);
             }
 
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -181,33 +440,81 @@ fn start_ping_service(app_handle: AppHandle, state: Arc<AppState>) {
     });
 }
 
+/// Saved data structure for persistence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedData {
+    history: HashMap<String, VecDeque<PingResult>>,
+    targets: Vec<String>,
+    primary_target: String,
+    notification_threshold_ms: u32,
+}
+
 /// Save history to disk
-fn save_history(history: &VecDeque<PingResult>) -> Result<(), Box<dyn std::error::Error>> {
+fn save_history(
+    history: &HashMap<String, VecDeque<PingResult>>,
+    targets: &[String],
+    primary_target: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(data_dir) = dirs::data_dir() {
         let app_dir = data_dir.join("pingzilla");
         std::fs::create_dir_all(&app_dir)?;
-        let file_path = app_dir.join("history.json");
-        let json = serde_json::to_string(history)?;
+        let file_path = app_dir.join("history_v2.json");
+        let data = SavedData {
+            history: history.clone(),
+            targets: targets.to_vec(),
+            primary_target: primary_target.to_string(),
+            notification_threshold_ms: 400,
+        };
+        let json = serde_json::to_string(&data)?;
         std::fs::write(file_path, json)?;
     }
     Ok(())
 }
 
 /// Load history from disk
-fn load_history() -> VecDeque<PingResult> {
+fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String) {
     if let Some(data_dir) = dirs::data_dir() {
+        // Try new format first
+        let file_path_v2 = data_dir.join("pingzilla").join("history_v2.json");
+        if let Ok(json) = std::fs::read_to_string(&file_path_v2) {
+            if let Ok(data) = serde_json::from_str::<SavedData>(&json) {
+                let cutoff = Utc::now() - chrono::Duration::hours(24);
+                let filtered_history: HashMap<String, VecDeque<PingResult>> = data
+                    .history
+                    .into_iter()
+                    .map(|(target, pings)| {
+                        let filtered: VecDeque<PingResult> =
+                            pings.into_iter().filter(|r| r.timestamp > cutoff).collect();
+                        (target, filtered)
+                    })
+                    .collect();
+                return (filtered_history, data.targets, data.primary_target);
+            }
+        }
+
+        // Fall back to old format for migration
         let file_path = data_dir.join("pingzilla").join("history.json");
         if let Ok(json) = std::fs::read_to_string(file_path) {
             if let Ok(history) = serde_json::from_str::<VecDeque<PingResult>>(&json) {
                 let cutoff = Utc::now() - chrono::Duration::hours(24);
-                return history
+                let filtered: VecDeque<PingResult> = history
                     .into_iter()
                     .filter(|r| r.timestamp > cutoff)
                     .collect();
+                let target = filtered
+                    .front()
+                    .map(|r| r.target.clone())
+                    .unwrap_or_else(|| "8.8.8.8".to_string());
+                let mut map = HashMap::new();
+                map.insert(target.clone(), filtered);
+                return (map, vec![target.clone()], target);
             }
         }
     }
-    VecDeque::new()
+
+    let mut history = HashMap::new();
+    history.insert("8.8.8.8".to_string(), VecDeque::new());
+    (history, vec!["8.8.8.8".to_string()], "8.8.8.8".to_string())
 }
 
 /// Position window below tray icon (macOS)
@@ -248,10 +555,12 @@ fn position_window_at_tray(window: &tauri::WebviewWindow, tray_rect: tauri::Rect
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let loaded_history = load_history();
+    let (loaded_history, loaded_targets, loaded_primary) = load_history();
 
     let app_state = Arc::new(AppState {
         ping_history: Mutex::new(loaded_history),
+        targets: Mutex::new(loaded_targets),
+        primary_target: Mutex::new(loaded_primary),
         ..Default::default()
     });
 
@@ -266,9 +575,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_current_ping,
             get_ping_history,
-            set_ping_target,
+            get_targets,
+            add_target,
+            remove_target,
+            set_primary_target,
             set_notification_threshold,
             get_settings,
+            get_statistics,
+            set_display_mode,
         ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
