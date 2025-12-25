@@ -211,14 +211,25 @@ async fn set_display_mode(
             None => "---".to_string(),
         };
 
-        // Load icons for switching
-        let icon_bytes = include_bytes!("../icons/32x32.png");
+        // Load Godzilla icons based on latency
+        let icon_happy = include_bytes!("../icons/pingzilla_happy.png");
+        let icon_angry = include_bytes!("../icons/pinzilla_angry.png");
+        let icon_sad = include_bytes!("../icons/pingzilla_sad.png");
+        let icon_dead = include_bytes!("../icons/pingzilla_dead.png");
         let transparent_bytes = include_bytes!("../icons/transparent.png");
+
+        // Choose icon based on latency
+        let status_icon = match current_ping {
+            Some(ms) if ms < 60.0 => icon_happy.as_slice(),
+            Some(ms) if ms < 150.0 => icon_angry.as_slice(),
+            Some(_) => icon_sad.as_slice(),
+            None => icon_dead.as_slice(),
+        };
 
         match display_mode {
             DisplayMode::IconOnly => {
                 // Show icon, hide text
-                if let Ok(icon) = Image::from_bytes(icon_bytes) {
+                if let Ok(icon) = Image::from_bytes(status_icon) {
                     let _ = tray.set_icon(Some(icon));
                     let _ = tray.set_icon_as_template(true);
                 }
@@ -226,7 +237,7 @@ async fn set_display_mode(
             }
             DisplayMode::IconAndPing => {
                 // Show both icon and ping text
-                if let Ok(icon) = Image::from_bytes(icon_bytes) {
+                if let Ok(icon) = Image::from_bytes(status_icon) {
                     let _ = tray.set_icon(Some(icon));
                     let _ = tray.set_icon_as_template(true);
                 }
@@ -364,14 +375,25 @@ fn start_ping_service(app_handle: AppHandle, state: Arc<AppState>) {
                             None => "---".to_string(),
                         };
 
-                        // Load icons for switching
-                        let icon_bytes = include_bytes!("../icons/32x32.png");
+                        // Load Godzilla icons based on latency
+                        let icon_happy = include_bytes!("../icons/pingzilla_happy.png");
+                        let icon_angry = include_bytes!("../icons/pinzilla_angry.png");
+                        let icon_sad = include_bytes!("../icons/pingzilla_sad.png");
+                        let icon_dead = include_bytes!("../icons/pingzilla_dead.png");
                         let transparent_bytes = include_bytes!("../icons/transparent.png");
+
+                        // Choose icon based on latency
+                        let status_icon = match latency_ms {
+                            Some(ms) if ms < 60.0 => icon_happy.as_slice(),
+                            Some(ms) if ms < 150.0 => icon_angry.as_slice(),
+                            Some(_) => icon_sad.as_slice(),
+                            None => icon_dead.as_slice(),
+                        };
 
                         match display_mode {
                             DisplayMode::IconOnly => {
                                 // Show icon, hide text
-                                if let Ok(icon) = Image::from_bytes(icon_bytes) {
+                                if let Ok(icon) = Image::from_bytes(status_icon) {
                                     let _ = tray.set_icon(Some(icon));
                                     let _ = tray.set_icon_as_template(true);
                                 }
@@ -379,7 +401,7 @@ fn start_ping_service(app_handle: AppHandle, state: Arc<AppState>) {
                             }
                             DisplayMode::IconAndPing => {
                                 // Show both icon and ping text
-                                if let Ok(icon) = Image::from_bytes(icon_bytes) {
+                                if let Ok(icon) = Image::from_bytes(status_icon) {
                                     let _ = tray.set_icon(Some(icon));
                                     let _ = tray.set_icon_as_template(true);
                                 }
@@ -591,7 +613,8 @@ pub fn run() {
             let quit = MenuItem::with_id(app, "quit", "Quit PingZilla", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&quit])?;
 
-            let icon_bytes = include_bytes!("../icons/32x32.png");
+            // Start with happy Godzilla icon (will update based on ping latency)
+            let icon_bytes = include_bytes!("../icons/pingzilla_happy.png");
             let icon = Image::from_bytes(icon_bytes)?;
 
             let _tray = TrayIconBuilder::with_id("main-tray")

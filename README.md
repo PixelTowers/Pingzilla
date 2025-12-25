@@ -2,18 +2,44 @@
 
 > *When your latency needs a monster to keep it in check*
 
+<p align="center">
+  <img src="src-tauri/icons/icon.png" width="128" alt="PingZilla App Icon">
+</p>
+
 A lightweight macOS menu bar application that monitors your network latency in real-time. Built with Tauri 2, React, and Rust.
 
 ## Features
 
 - **Live Menu Bar Display** - Current ping displayed right in your menu bar
+- **Dynamic Menu Bar Icons** - PingZilla's mood changes based on latency:
+  - Happy (< 60ms) - Everything is great!
+  - Angry (60-150ms) - Getting concerned...
+  - Sad (> 150ms) - Network troubles!
+  - Dead (timeout) - No response!
+- **Multiple Targets** - Monitor multiple hosts simultaneously with tabbed interface
+- **Statistics Dashboard** - View min/max/avg latency, uptime percentage, and packet loss
 - **Real-Time Graph** - Visual history of the last 2 minutes of ping data
+- **Display Mode Options** - Choose what to show in menu bar:
+  - Icon + Ping (default)
+  - Icon Only
+  - Ping Only
 - **Smart Notifications** - Get alerted when latency exceeds your threshold (default: 400ms)
 - **Configurable Target** - Ping any host (default: 8.8.8.8)
 - **Persistent History** - Stores up to 24 hours of ping data locally
 - **Smooth Animations** - Buttery smooth number transitions
 - **Native Performance** - Rust backend with minimal resource usage
 - **No Root Required** - Uses system ping command
+
+## Menu Bar Icons
+
+PingZilla uses expressive icons to show network health at a glance:
+
+| Icon | Latency | Mood |
+|------|---------|------|
+| ![Happy](src-tauri/icons/pingzilla_happy.png) | < 60ms | Happy |
+| ![Angry](src-tauri/icons/pinzilla_angry.png) | 60-150ms | Angry |
+| ![Sad](src-tauri/icons/pingzilla_sad.png) | > 150ms | Sad |
+| ![Dead](src-tauri/icons/pingzilla_dead.png) | Timeout | Dead |
 
 ## Screenshot
 
@@ -61,6 +87,7 @@ The built app will be in `src-tauri/target/release/bundle/macos/`.
 4. **Settings** - Click "Settings" in the popup to configure:
    - **Target**: The host to ping
    - **Alert threshold**: Latency (in ms) that triggers notifications
+   - **Display Mode**: What to show in the menu bar
 
 ## Tech Stack
 
@@ -72,8 +99,8 @@ The built app will be in `src-tauri/target/release/bundle/macos/`.
 
 | Color  | Latency    | Status    |
 |--------|------------|-----------|
-| Green  | < 50ms     | Excellent |
-| Yellow | 50-150ms   | Good      |
+| Green  | < 60ms     | Excellent |
+| Yellow | 60-150ms   | Good      |
 | Red    | > 150ms    | Poor      |
 | Gray   | Timeout    | No response |
 
