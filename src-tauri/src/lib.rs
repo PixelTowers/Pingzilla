@@ -306,8 +306,29 @@ async fn get_statistics(
     })
 }
 
+/// Perform a TCP connect to measure latency (works in App Sandbox)
+async fn do_tcp_ping(target: &str, port: u16) -> Option<f64> {
+    use std::time::Instant;
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+
+    // For IP addresses, connect directly. For hostnames, try to resolve first.
+    let addr = if target.parse::<std::net::IpAddr>().is_ok() {
+        format!("{}:{}", target, port)
+    } else {
+        format!("{}:{}", target, port)
+    };
+
+    let start = Instant::now();
+
+    match timeout(Duration::from_secs(2), TcpStream::connect(&addr)).await {
+        Ok(Ok(_stream)) => Some(start.elapsed().as_secs_f64() * 1000.0),
+        _ => None,
+    }
+}
+
 /// Perform a single ping using system ping command (no root needed)
-async fn do_ping(target: &str) -> Option<f64> {
+async fn do_system_ping(target: &str) -> Option<f64> {
     use std::process::Command;
 
     let output = Command::new("ping")
@@ -334,6 +355,23 @@ async fn do_ping(target: &str) -> Option<f64> {
     }
 
     None
+}
+
+/// Perform a ping with automatic fallback to TCP if system ping fails
+/// This ensures the app works in the App Sandbox
+async fn do_ping(target: &str) -> Option<f64> {
+    // Try system ping first (more accurate ICMP timing)
+    if let Some(ms) = do_system_ping(target).await {
+        return Some(ms);
+    }
+
+    // Fallback to TCP connect measurement (works in sandbox)
+    // Try HTTPS port first (443), then HTTP (80)
+    if let Some(ms) = do_tcp_ping(target, 443).await {
+        return Some(ms);
+    }
+
+    do_tcp_ping(target, 80).await
 }
 
 /// Start the ping service background task - pings all targets

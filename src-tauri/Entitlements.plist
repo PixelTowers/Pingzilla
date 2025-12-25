@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- ABOUTME: macOS App Sandbox entitlements for App Store distribution -->
+<!-- ABOUTME: Replace YOUR_TEAM_ID with your Apple Developer Team ID before submission -->
+<plist version="1.0">
+<dict>
+    <!-- Required for App Store: Enable App Sandbox -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+
+    <!-- Allow outgoing network connections (for ping functionality) -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- App identifier - Replace YOUR_TEAM_ID with your actual Team ID -->
+    <key>com.apple.application-identifier</key>
+    <string>YOUR_TEAM_ID.com.pingzilla.monitor</string>
+
+    <!-- Team identifier - Replace YOUR_TEAM_ID with your actual Team ID -->
+    <key>com.apple.developer.team-identifier</key>
+    <string>YOUR_TEAM_ID</string>
+</dict>
+</plist>

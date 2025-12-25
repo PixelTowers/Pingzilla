@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- ABOUTME: Additional Info.plist settings for App Store compliance -->
+<!-- ABOUTME: Declares encryption usage for export compliance -->
+<plist version="1.0">
+<dict>
+    <!-- Encryption compliance: PingZilla does not use non-exempt encryption -->
+    <!-- HTTPS/TLS connections are exempt from export restrictions -->
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
+</dict>
+</plist>
