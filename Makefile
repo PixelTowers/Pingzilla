@@ -3,8 +3,13 @@
 
 # Configuration
 APP_NAME := PingZilla
-BUNDLE_ID := com.pingzilla.monitor
+BUNDLE_ID := pingzilla.pixeltowers.io
+TEAM_ID := Y5223T2D8X
 VERSION := $(shell grep '"version"' src-tauri/tauri.conf.json | head -1 | sed 's/.*: "\(.*\)".*/\1/')
+
+# Signing Identities
+DIST_CERT := Apple Distribution: PixelTowers OU ($(TEAM_ID))
+INSTALLER_CERT := 3rd Party Mac Developer Installer: PixelTowers OU ($(TEAM_ID))
 
 # Paths
 BUILD_DIR := src-tauri/target
@@ -12,13 +17,16 @@ RELEASE_DIR := $(BUILD_DIR)/release
 UNIVERSAL_DIR := $(BUILD_DIR)/universal-apple-darwin/release
 APP_BUNDLE := $(RELEASE_DIR)/bundle/macos/$(APP_NAME).app
 UNIVERSAL_APP := $(UNIVERSAL_DIR)/bundle/macos/$(APP_NAME).app
+PKG_FILE := $(UNIVERSAL_DIR)/$(APP_NAME)-$(VERSION).pkg
+ENTITLEMENTS := src-tauri/Entitlements.plist
+PROVISION_PROFILE := src-tauri/embedded.provisionprofile
 
 # Colors for output
 GREEN := \033[0;32m
 YELLOW := \033[0;33m
 NC := \033[0m # No Color
 
-.PHONY: help dev build release universal clean run kill pkg sign upload lint check
+.PHONY: help dev build release universal clean run kill pkg sign upload lint check appstore clean-profile
 
 help: ## Show this help message
 	@echo "$(GREEN)PingZilla Build System$(NC)"
@@ -56,39 +64,69 @@ universal: ## Build universal binary (Intel + Apple Silicon)
 	@echo "App: $(UNIVERSAL_APP)"
 
 # App Store
-pkg: universal ## Create installer package for App Store
+clean-profile: ## Remove quarantine from provisioning profile
+	@echo "$(GREEN)Cleaning provisioning profile...$(NC)"
+	@if [ -f "$(PROVISION_PROFILE)" ]; then \
+		xxd "$(PROVISION_PROFILE)" > /tmp/profile.hex && \
+		xxd -r /tmp/profile.hex > /tmp/clean_profile.provisionprofile && \
+		cp /tmp/clean_profile.provisionprofile "$(PROVISION_PROFILE)" && \
+		echo "$(GREEN)Profile cleaned!$(NC)"; \
+	else \
+		echo "$(YELLOW)No provisioning profile found at $(PROVISION_PROFILE)$(NC)"; \
+		echo "Download from Apple Developer Portal and place in src-tauri/embedded.provisionprofile"; \
+	fi
+
+sign: universal ## Sign the app for App Store distribution
+	@echo "$(GREEN)Embedding provisioning profile...$(NC)"
+	@if [ ! -f "$(PROVISION_PROFILE)" ]; then \
+		echo "$(YELLOW)ERROR: Provisioning profile not found!$(NC)"; \
+		echo "Download from Apple Developer Portal and save as:"; \
+		echo "  $(PROVISION_PROFILE)"; \
+		exit 1; \
+	fi
+	@xxd "$(PROVISION_PROFILE)" > /tmp/profile.hex
+	@xxd -r /tmp/profile.hex > "$(UNIVERSAL_APP)/Contents/embedded.provisionprofile"
+	@echo "$(GREEN)Signing app with: $(DIST_CERT)$(NC)"
+	codesign --deep --force --verify --verbose \
+		--sign "$(DIST_CERT)" \
+		--entitlements "$(ENTITLEMENTS)" \
+		--options runtime \
+		"$(UNIVERSAL_APP)"
+	@echo "$(GREEN)App signed successfully!$(NC)"
+
+pkg: sign ## Create signed installer package for App Store
 	@echo "$(GREEN)Creating installer package...$(NC)"
-	@echo "$(YELLOW)Note: You need to sign with your certificate$(NC)"
-	@echo ""
-	@echo "Run manually:"
-	@echo "  xcrun productbuild --sign \"3rd Party Mac Developer Installer: YOUR NAME (TEAM_ID)\" \\"
-	@echo "    --component \"$(UNIVERSAL_APP)\" /Applications \"$(APP_NAME).pkg\""
+	productbuild --component "$(UNIVERSAL_APP)" /Applications \
+		--sign "$(INSTALLER_CERT)" \
+		"$(PKG_FILE)"
+	@echo "$(GREEN)Package created: $(PKG_FILE)$(NC)"
 
-sign: ## Sign the app for distribution (requires certificate)
-	@echo "$(YELLOW)Manual signing required:$(NC)"
+appstore: pkg ## Full App Store build pipeline (build, sign, package)
 	@echo ""
-	@echo "1. Sign the app:"
-	@echo "   codesign --deep --force --verify --verbose \\"
-	@echo "     --sign \"Apple Distribution: YOUR NAME (TEAM_ID)\" \\"
-	@echo "     --options runtime \\"
-	@echo "     --entitlements src-tauri/Entitlements.plist \\"
-	@echo "     \"$(UNIVERSAL_APP)\""
+	@echo "$(GREEN)========================================$(NC)"
+	@echo "$(GREEN)App Store package ready!$(NC)"
+	@echo "$(GREEN)========================================$(NC)"
 	@echo ""
-	@echo "2. Create installer package:"
-	@echo "   xcrun productbuild --sign \"3rd Party Mac Developer Installer: YOUR NAME (TEAM_ID)\" \\"
-	@echo "     --component \"$(UNIVERSAL_APP)\" /Applications \"$(APP_NAME).pkg\""
+	@echo "Package: $(PKG_FILE)"
+	@echo ""
+	@echo "To upload, run: make upload"
 
-upload: ## Upload to App Store Connect (requires API key)
+upload: ## Upload to App Store Connect
 	@echo "$(YELLOW)Upload to App Store Connect:$(NC)"
 	@echo ""
-	@echo "Option 1 - Using altool:"
-	@echo "  xcrun altool --upload-app --type macos --file \"$(APP_NAME).pkg\" \\"
-	@echo "    --apiKey YOUR_API_KEY_ID --apiIssuer YOUR_API_ISSUER"
+	@echo "Option 1 - Using Transporter (recommended):"
+	@echo "  1. Open Transporter app"
+	@echo "  2. Drag $(PKG_FILE)"
+	@echo "  3. Click Deliver"
 	@echo ""
-	@echo "Option 2 - Using Transporter app (GUI):"
-	@echo "  1. Download Transporter from App Store"
-	@echo "  2. Open and sign in with Apple ID"
-	@echo "  3. Drag $(APP_NAME).pkg to upload"
+	@echo "Option 2 - Using altool with App-Specific Password:"
+	@echo "  xcrun altool --upload-app \\"
+	@echo "    -f \"$(PKG_FILE)\" \\"
+	@echo "    -t macos \\"
+	@echo "    -u \"YOUR_APPLE_ID\" \\"
+	@echo "    -p \"YOUR_APP_SPECIFIC_PASSWORD\""
+	@echo ""
+	@echo "Generate App-Specific Password at: https://appleid.apple.com"
 
 # Maintenance
 clean: ## Clean build artifacts

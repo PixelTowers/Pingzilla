@@ -41,9 +41,16 @@ PingZilla uses expressive icons to show network health at a glance:
 | ![Sad](src-tauri/icons/pingzilla_sad.png) | > 150ms | Sad |
 | ![Dead](src-tauri/icons/pingzilla_dead.png) | Timeout | Dead |
 
-## Screenshot
+## Screenshots
 
-*[Coming soon - add screenshot here]*
+<p align="center">
+  <img src="screenshots/screenshot1.jpeg" width="800" alt="PingZilla Hero">
+</p>
+
+<p align="center">
+  <img src="screenshots/screenshot3.png" width="400" alt="PingZilla Popup">
+  <img src="screenshots/screenshot2.png" width="400" alt="PingZilla Menu Bar">
+</p>
 
 ## Installation
 
@@ -79,6 +86,29 @@ pnpm tauri build
 
 The built app will be in `src-tauri/target/release/bundle/macos/`.
 
+### App Store Build
+
+To build for Mac App Store submission:
+
+```bash
+# Full pipeline: build universal binary, sign, and create .pkg
+make appstore
+
+# Or step by step:
+make universal    # Build universal binary (Intel + Apple Silicon)
+make sign         # Sign with Apple Distribution certificate
+make pkg          # Create signed installer package
+make upload       # Show upload instructions
+```
+
+**Prerequisites for App Store:**
+1. Apple Developer account
+2. App Store provisioning profile (save as `src-tauri/embedded.provisionprofile`)
+3. Certificates installed in Keychain:
+   - Apple Distribution certificate
+   - 3rd Party Mac Developer Installer certificate
+4. Apple WWDR intermediate certificate
+
 ## Usage
 
 1. **Launch** - PingZilla appears in your menu bar showing the current ping
@@ -94,6 +124,23 @@ The built app will be in `src-tauri/target/release/bundle/macos/`.
 - **Frontend**: React 19, TypeScript, Recharts
 - **Backend**: Rust, Tauri 2
 - **Build**: Vite, pnpm
+
+## Make Targets
+
+Run `make help` to see all available commands:
+
+| Command | Description |
+|---------|-------------|
+| `make dev` | Start development server with hot reload |
+| `make build` | Build for current architecture |
+| `make universal` | Build universal binary (Intel + Apple Silicon) |
+| `make appstore` | Full App Store build pipeline |
+| `make sign` | Sign app for distribution |
+| `make pkg` | Create installer package |
+| `make upload` | Show upload instructions |
+| `make clean` | Clean build artifacts |
+| `make lint` | Run linters |
+| `make info` | Show build info |
 
 ## Color Indicators
 
