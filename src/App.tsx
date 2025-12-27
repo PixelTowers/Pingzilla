@@ -84,8 +84,8 @@ interface ChartData {
 type DisplayMode = "icon_only" | "icon_and_ping" | "ping_only";
 
 function App() {
-  const [targets, setTargets] = useState<string[]>(["8.8.8.8"]);
-  const [activeTarget, setActiveTarget] = useState("8.8.8.8");
+  const [targets, setTargets] = useState<string[]>(["1.1.1.1"]);
+  const [activeTarget, setActiveTarget] = useState("1.1.1.1");
   const [currentPings, setCurrentPings] = useState<Record<string, number | null>>({});
   const [histories, setHistories] = useState<Record<string, ChartData[]>>({});
   const [statistics, setStatistics] = useState<PingStatistics | null>(null);
@@ -352,6 +352,32 @@ function App() {
       {/* Settings Panel */}
       {showSettings && (
         <div className="settings-panel">
+          <div className="setting-row">
+            <label>Ping target:</label>
+            <input
+              type="text"
+              value={activeTarget}
+              onChange={(e) => {
+                const newTarget = e.target.value;
+                setActiveTarget(newTarget);
+              }}
+              onBlur={async () => {
+                if (activeTarget.trim()) {
+                  try {
+                    if (!targets.includes(activeTarget)) {
+                      await invoke("add_target", { target: activeTarget.trim() });
+                      const updatedTargets = await invoke<string[]>("get_targets");
+                      setTargets(updatedTargets);
+                    }
+                    await invoke("set_primary_target", { target: activeTarget.trim() });
+                  } catch (e) {
+                    console.error("Failed to update target:", e);
+                  }
+                }
+              }}
+              placeholder="IP or hostname"
+            />
+          </div>
           <div className="setting-row">
             <label>Menu bar:</label>
             <select

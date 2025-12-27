@@ -56,11 +56,11 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         let mut history = HashMap::new();
-        history.insert("8.8.8.8".to_string(), VecDeque::with_capacity(1000));
+        history.insert("1.1.1.1".to_string(), VecDeque::with_capacity(1000));
         Self {
             ping_history: Mutex::new(history),
-            targets: Mutex::new(vec!["8.8.8.8".to_string()]),
-            primary_target: Mutex::new("8.8.8.8".to_string()),
+            targets: Mutex::new(vec!["1.1.1.1".to_string()]),
+            primary_target: Mutex::new("1.1.1.1".to_string()),
             notification_threshold_ms: Mutex::new(400),
             last_notification: Mutex::new(None),
             display_mode: Mutex::new(DisplayMode::IconAndPing),
@@ -366,7 +366,12 @@ async fn do_ping(target: &str) -> Option<f64> {
     }
 
     // Fallback to TCP connect measurement (works in sandbox)
-    // Try HTTPS port first (443), then HTTP (80)
+    // Try DNS port first (works for DNS servers like 1.1.1.1)
+    if let Some(ms) = do_tcp_ping(target, 53).await {
+        return Some(ms);
+    }
+
+    // Then try HTTPS and HTTP ports (works for web servers)
     if let Some(ms) = do_tcp_ping(target, 443).await {
         return Some(ms);
     }
@@ -564,7 +569,7 @@ fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String
                 let target = filtered
                     .front()
                     .map(|r| r.target.clone())
-                    .unwrap_or_else(|| "8.8.8.8".to_string());
+                    .unwrap_or_else(|| "1.1.1.1".to_string());
                 let mut map = HashMap::new();
                 map.insert(target.clone(), filtered);
                 return (map, vec![target.clone()], target);
@@ -573,8 +578,8 @@ fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String
     }
 
     let mut history = HashMap::new();
-    history.insert("8.8.8.8".to_string(), VecDeque::new());
-    (history, vec!["8.8.8.8".to_string()], "8.8.8.8".to_string())
+    history.insert("1.1.1.1".to_string(), VecDeque::new());
+    (history, vec!["1.1.1.1".to_string()], "1.1.1.1".to_string())
 }
 
 /// Position window below tray icon (macOS)
