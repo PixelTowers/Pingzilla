@@ -1,24 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- ABOUTME: macOS App Sandbox entitlements for App Store distribution -->
-<!-- ABOUTME: Team ID: Y5223T2D8X, Bundle ID: pingzilla.pixeltowers.io -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Required for App Store: Enable App Sandbox -->
     <key>com.apple.security.app-sandbox</key>
     <true/>
-
-    <!-- Allow outgoing network connections (for ping functionality) -->
     <key>com.apple.security.network.client</key>
     <true/>
-
-    <!-- App identifier -->
-    <key>com.apple.application-identifier</key>
-    <string>Y5223T2D8X.pingzilla.pixeltowers.io</string>
-
-    <!-- Team identifier -->
-    <key>com.apple.developer.team-identifier</key>
-    <string>Y5223T2D8X</string>
 </dict>
 </plist>
