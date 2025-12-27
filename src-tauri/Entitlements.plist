@@ -6,5 +6,7 @@
     <true/>
     <key>com.apple.security.network.client</key>
     <true/>
+    <key>com.apple.application-identifier</key>
+    <string>Y5223T2D8X.pingzilla.pixeltowers.io</string>
 </dict>
 </plist>
