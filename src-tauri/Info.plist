@@ -9,8 +9,5 @@
     <!-- HTTPS/TLS connections are exempt from export restrictions -->
     <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
-    <!-- Hide from Dock - menu bar only app -->
-    <key>LSUIElement</key>
-    <true/>
 </dict>
 </plist>
