@@ -650,8 +650,9 @@ pub fn run() {
             set_display_mode,
         ])
         .setup(move |app| {
+            // Show in Dock - required for ping to work in sandboxed App Store builds
             #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            app.set_activation_policy(tauri::ActivationPolicy::Regular);
 
             let quit = MenuItem::with_id(app, "quit", "Quit PingZilla", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&quit])?;
