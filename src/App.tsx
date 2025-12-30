@@ -81,7 +81,39 @@ interface ChartData {
   latency: number | null;
 }
 
+interface IpInfo {
+  ip: string;
+  country: string;
+  country_code: string;
+  city: string | null;
+  isp: string | null;
+}
+
+interface SiteMonitor {
+  url: string;
+  name: string | null;
+  enabled: boolean;
+}
+
+interface SiteStatus {
+  url: string;
+  is_up: boolean;
+  latency_ms: number | null;
+  last_check: string;
+  last_down: string | null;
+}
+
 type DisplayMode = "icon_only" | "icon_and_ping" | "ping_only";
+
+// Convert country code to flag emoji
+const countryCodeToFlag = (code: string): string => {
+  if (!code || code.length !== 2) return "";
+  return code
+    .toUpperCase()
+    .split("")
+    .map((char) => String.fromCodePoint(127397 + char.charCodeAt(0)))
+    .join("");
+};
 
 function App() {
   const [targets, setTargets] = useState<string[]>(["1.1.1.1"]);
@@ -93,9 +125,14 @@ function App() {
   const [threshold, setThreshold] = useState(400);
   const [displayMode, setDisplayMode] = useState<DisplayMode>("icon_and_ping");
   const [showSettings, setShowSettings] = useState(false);
-  const [showAddTarget, setShowAddTarget] = useState(false);
-  const [newTarget, setNewTarget] = useState("");
   const [launchAtLogin, setLaunchAtLogin] = useState(false);
+  const [ipInfo, setIpInfo] = useState<IpInfo | null>(null);
+  const [ipLoading, setIpLoading] = useState(false);
+  const [siteMonitors, setSiteMonitors] = useState<SiteMonitor[]>([]);
+  const [siteStatuses, setSiteStatuses] = useState<Record<string, SiteStatus>>({});
+  const [showAddSite, setShowAddSite] = useState(false);
+  const [newSiteUrl, setNewSiteUrl] = useState("");
+  const [newSiteName, setNewSiteName] = useState("");
 
   // Load initial data and settings
   useEffect(() => {
@@ -140,6 +177,24 @@ function App() {
 
         setHistories(newHistories);
         setCurrentPings(newCurrentPings);
+
+        // Load IP info
+        try {
+          const loadedIpInfo = await invoke<IpInfo>("get_my_ip_info", {});
+          setIpInfo(loadedIpInfo);
+        } catch (e) {
+          console.error("Failed to load IP info:", e);
+        }
+
+        // Load site monitors
+        try {
+          const loadedMonitors = await invoke<SiteMonitor[]>("get_site_monitors");
+          setSiteMonitors(loadedMonitors);
+          const loadedStatuses = await invoke<Record<string, SiteStatus>>("get_site_statuses");
+          setSiteStatuses(loadedStatuses);
+        } catch (e) {
+          console.error("Failed to load site monitors:", e);
+        }
       } catch (e) {
         console.error("Failed to load initial data:", e);
       }
@@ -200,6 +255,61 @@ function App() {
     };
   }, []);
 
+  // Listen for site status updates
+  useEffect(() => {
+    const unlisten = listen<Record<string, SiteStatus>>("site-status-update", (event) => {
+      setSiteStatuses(event.payload);
+    });
+
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  const refreshIpInfo = useCallback(async () => {
+    setIpLoading(true);
+    try {
+      const info = await invoke<IpInfo>("get_my_ip_info", { forceRefresh: true });
+      setIpInfo(info);
+    } catch (e) {
+      console.error("Failed to refresh IP info:", e);
+    } finally {
+      setIpLoading(false);
+    }
+  }, []);
+
+  const addSiteMonitor = useCallback(async () => {
+    if (!newSiteUrl.trim()) return;
+    try {
+      await invoke("add_site_monitor", {
+        url: newSiteUrl.trim(),
+        name: newSiteName.trim() || null,
+      });
+      const updatedMonitors = await invoke<SiteMonitor[]>("get_site_monitors");
+      setSiteMonitors(updatedMonitors);
+      setNewSiteUrl("");
+      setNewSiteName("");
+      setShowAddSite(false);
+    } catch (e) {
+      console.error("Failed to add site monitor:", e);
+    }
+  }, [newSiteUrl, newSiteName]);
+
+  const removeSiteMonitor = useCallback(async (url: string) => {
+    try {
+      await invoke("remove_site_monitor", { url });
+      const updatedMonitors = await invoke<SiteMonitor[]>("get_site_monitors");
+      setSiteMonitors(updatedMonitors);
+      setSiteStatuses((prev) => {
+        const next = { ...prev };
+        delete next[url];
+        return next;
+      });
+    } catch (e) {
+      console.error("Failed to remove site monitor:", e);
+    }
+  }, []);
+
   const saveSettings = useCallback(async () => {
     try {
       await invoke("set_notification_threshold", { thresholdMs: threshold });
@@ -209,41 +319,6 @@ function App() {
       console.error("Failed to save settings:", e);
     }
   }, [threshold, displayMode]);
-
-  const addTarget = useCallback(async () => {
-    if (!newTarget.trim()) return;
-    try {
-      await invoke("add_target", { target: newTarget.trim() });
-      const updatedTargets = await invoke<string[]>("get_targets");
-      setTargets(updatedTargets);
-      setNewTarget("");
-      setShowAddTarget(false);
-    } catch (e) {
-      console.error("Failed to add target:", e);
-    }
-  }, [newTarget]);
-
-  const removeTarget = useCallback(async (target: string) => {
-    try {
-      await invoke("remove_target", { target });
-      const updatedTargets = await invoke<string[]>("get_targets");
-      setTargets(updatedTargets);
-      if (activeTarget === target && updatedTargets.length > 0) {
-        setActiveTarget(updatedTargets[0]);
-      }
-    } catch (e) {
-      console.error("Failed to remove target:", e);
-    }
-  }, [activeTarget]);
-
-  const switchTarget = useCallback(async (target: string) => {
-    setActiveTarget(target);
-    try {
-      await invoke("set_primary_target", { target });
-    } catch (e) {
-      console.error("Failed to set primary target:", e);
-    }
-  }, []);
 
   const toggleLaunchAtLogin = useCallback(async () => {
     try {
@@ -290,64 +365,24 @@ function App() {
         </button>
       </div>
 
-      {/* Target Tabs */}
-      <div className="tabs-container">
-        <div className="tabs">
-          {targets.map((target) => (
-            <div
-              key={target}
-              className={`tab ${activeTarget === target ? "active" : ""}`}
-              onClick={() => switchTarget(target)}
-            >
-              <span className="tab-name">{target}</span>
-              <span
-                className="tab-ping"
-                style={{ color: getPingColor(currentPings[target] ?? null) }}
-              >
-                {currentPings[target] !== undefined && currentPings[target] !== null
-                  ? `${Math.round(currentPings[target])}ms`
-                  : "---"}
-              </span>
-              {targets.length > 1 && (
-                <button
-                  className="tab-close"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    removeTarget(target);
-                  }}
-                >
-                  ×
-                </button>
-              )}
-            </div>
-          ))}
-          <button className="tab-add" onClick={() => setShowAddTarget(true)}>
-            +
+      {/* IP Info Bar */}
+      {ipInfo && (
+        <div className="ip-info-bar">
+          <span className="ip-label">Your IP</span>
+          <span className="ip-flag">{countryCodeToFlag(ipInfo.country_code)}</span>
+          <span className="ip-address">{ipInfo.ip}</span>
+          <span className="ip-country">{ipInfo.country}</span>
+          <button
+            className="ip-refresh-btn"
+            onClick={refreshIpInfo}
+            disabled={ipLoading}
+            title="Refresh IP info"
+          >
+            {ipLoading ? "..." : "↻"}
           </button>
         </div>
-      </div>
-
-      {/* Add Target Modal */}
-      {showAddTarget && (
-        <div className="add-target-panel">
-          <input
-            type="text"
-            value={newTarget}
-            onChange={(e) => setNewTarget(e.target.value)}
-            placeholder="Enter hostname or IP"
-            onKeyDown={(e) => e.key === "Enter" && addTarget()}
-            autoFocus
-          />
-          <div className="add-target-buttons">
-            <button className="cancel-btn" onClick={() => setShowAddTarget(false)}>
-              Cancel
-            </button>
-            <button className="save-btn" onClick={addTarget}>
-              Add
-            </button>
-          </div>
-        </div>
       )}
+
 
       {/* Settings Panel */}
       {showSettings && (
@@ -510,6 +545,80 @@ function App() {
             />
           </LineChart>
         </ResponsiveContainer>
+      </div>
+
+      {/* Site Monitors Section */}
+      <div className="site-monitors-section">
+        <div className="section-header">
+          <span className="section-title">Site Monitors</span>
+          <button
+            className="site-add-btn"
+            onClick={() => setShowAddSite(!showAddSite)}
+            disabled={siteMonitors.length >= 10}
+            title={siteMonitors.length >= 10 ? "Max 10 sites" : "Add site"}
+          >
+            {showAddSite ? "×" : "+"}
+          </button>
+        </div>
+
+        {/* Add Site Panel */}
+        {showAddSite && (
+          <div className="add-site-panel">
+            <input
+              type="text"
+              value={newSiteUrl}
+              onChange={(e) => setNewSiteUrl(e.target.value)}
+              placeholder="URL (e.g., https://example.com)"
+              onKeyDown={(e) => e.key === "Enter" && addSiteMonitor()}
+              autoFocus
+            />
+            <input
+              type="text"
+              value={newSiteName}
+              onChange={(e) => setNewSiteName(e.target.value)}
+              placeholder="Name (optional)"
+              onKeyDown={(e) => e.key === "Enter" && addSiteMonitor()}
+            />
+            <div className="add-site-buttons">
+              <button className="cancel-btn" onClick={() => setShowAddSite(false)}>
+                Cancel
+              </button>
+              <button className="save-btn" onClick={addSiteMonitor}>
+                Add
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Site List */}
+        {siteMonitors.length > 0 ? (
+          <div className="site-list">
+            {siteMonitors.map((site) => {
+              const status = siteStatuses[site.url];
+              const isUp = status?.is_up ?? true;
+              return (
+                <div key={site.url} className={`site-item ${isUp ? "up" : "down"}`}>
+                  <span className={`status-dot ${isUp ? "up" : "down"}`} />
+                  <span className="site-name" title={site.url}>
+                    {site.name || site.url}
+                  </span>
+                  <span className="site-latency">
+                    {status?.latency_ms != null ? `${Math.round(status.latency_ms)}ms` : "---"}
+                  </span>
+                  <button
+                    className="site-remove-btn"
+                    onClick={() => removeSiteMonitor(site.url)}
+                    title="Remove"
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="site-empty">No sites monitored</div>
+        )}
       </div>
 
       {/* Footer */}

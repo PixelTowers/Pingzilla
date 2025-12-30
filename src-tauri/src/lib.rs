@@ -43,6 +43,34 @@ pub enum DisplayMode {
     PingOnly,
 }
 
+/// User's public IP info (for VPN verification)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpInfo {
+    pub ip: String,
+    pub country: String,
+    pub country_code: String,
+    pub city: Option<String>,
+    pub isp: Option<String>,
+}
+
+/// Site monitor configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteMonitor {
+    pub url: String,
+    pub name: Option<String>,
+    pub enabled: bool,
+}
+
+/// Site status from monitoring check
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteStatus {
+    pub url: String,
+    pub is_up: bool,
+    pub latency_ms: Option<f64>,
+    pub last_check: DateTime<Utc>,
+    pub last_down: Option<DateTime<Utc>>,
+}
+
 /// Application state shared across the app
 pub struct AppState {
     pub ping_history: Mutex<HashMap<String, VecDeque<PingResult>>>,
@@ -51,6 +79,10 @@ pub struct AppState {
     pub notification_threshold_ms: Mutex<u32>,
     pub last_notification: Mutex<Option<DateTime<Utc>>>,
     pub display_mode: Mutex<DisplayMode>,
+    pub ip_info: Mutex<Option<IpInfo>>,
+    pub ip_info_last_check: Mutex<Option<DateTime<Utc>>>,
+    pub site_monitors: Mutex<Vec<SiteMonitor>>,
+    pub site_statuses: Mutex<HashMap<String, SiteStatus>>,
 }
 
 impl Default for AppState {
@@ -64,6 +96,10 @@ impl Default for AppState {
             notification_threshold_ms: Mutex::new(400),
             last_notification: Mutex::new(None),
             display_mode: Mutex::new(DisplayMode::IconAndPing),
+            ip_info: Mutex::new(None),
+            ip_info_last_check: Mutex::new(None),
+            site_monitors: Mutex::new(Vec::new()),
+            site_statuses: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -306,6 +342,108 @@ async fn get_statistics(
     })
 }
 
+/// Get user's public IP info (for VPN verification)
+/// Uses ip-api.com - free API, no key required, 45 req/min limit
+/// Caches result for 5 minutes to avoid rate limiting
+#[tauri::command]
+async fn get_my_ip_info(
+    force_refresh: Option<bool>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<IpInfo, String> {
+    let force = force_refresh.unwrap_or(false);
+
+    // Check cache first (unless force refresh)
+    if !force {
+        let cached = state.ip_info.lock().await.clone();
+        let last_check = *state.ip_info_last_check.lock().await;
+
+        if let (Some(info), Some(checked_at)) = (cached, last_check) {
+            // Cache for 5 minutes
+            if Utc::now().signed_duration_since(checked_at).num_seconds() < 300 {
+                return Ok(info);
+            }
+        }
+    }
+
+    // Fetch from API
+    let resp = reqwest::get("http://ip-api.com/json/")
+        .await
+        .map_err(|e| format!("Failed to fetch IP info: {}", e))?;
+
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse IP info: {}", e))?;
+
+    let info = IpInfo {
+        ip: data["query"].as_str().unwrap_or("Unknown").to_string(),
+        country: data["country"].as_str().unwrap_or("Unknown").to_string(),
+        country_code: data["countryCode"].as_str().unwrap_or("").to_string(),
+        city: data["city"].as_str().map(String::from),
+        isp: data["isp"].as_str().map(String::from),
+    };
+
+    // Update cache
+    *state.ip_info.lock().await = Some(info.clone());
+    *state.ip_info_last_check.lock().await = Some(Utc::now());
+
+    Ok(info)
+}
+
+/// Get all site monitors
+#[tauri::command]
+async fn get_site_monitors(state: State<'_, Arc<AppState>>) -> Result<Vec<SiteMonitor>, String> {
+    let monitors = state.site_monitors.lock().await;
+    Ok(monitors.clone())
+}
+
+/// Add a new site monitor (max 10)
+#[tauri::command]
+async fn add_site_monitor(
+    url: String,
+    name: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let mut monitors = state.site_monitors.lock().await;
+
+    if monitors.len() >= 10 {
+        return Err("Maximum of 10 site monitors allowed".to_string());
+    }
+
+    if monitors.iter().any(|m| m.url == url) {
+        return Err("Site already being monitored".to_string());
+    }
+
+    monitors.push(SiteMonitor {
+        url,
+        name,
+        enabled: true,
+    });
+
+    Ok(())
+}
+
+/// Remove a site monitor
+#[tauri::command]
+async fn remove_site_monitor(url: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let mut monitors = state.site_monitors.lock().await;
+    monitors.retain(|m| m.url != url);
+
+    let mut statuses = state.site_statuses.lock().await;
+    statuses.remove(&url);
+
+    Ok(())
+}
+
+/// Get current site statuses
+#[tauri::command]
+async fn get_site_statuses(
+    state: State<'_, Arc<AppState>>,
+) -> Result<HashMap<String, SiteStatus>, String> {
+    let statuses = state.site_statuses.lock().await;
+    Ok(statuses.clone())
+}
+
 /// Perform a TCP connect to measure latency (works in App Sandbox)
 async fn do_tcp_ping(target: &str, port: u16) -> Option<f64> {
     use std::time::Instant;
@@ -387,6 +525,115 @@ async fn do_ping(target: &str) -> Option<f64> {
     }
 
     do_tcp_ping(target, 80).await
+}
+
+/// Check if a site is up by connecting to it
+/// Parses URL to determine host and port
+async fn check_site(url: &str) -> SiteStatus {
+    use std::time::Instant;
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+
+    let start = Instant::now();
+
+    // Parse URL to extract host and port
+    let (host, port) = if url.starts_with("https://") {
+        (url.trim_start_matches("https://").split('/').next().unwrap_or(url), 443)
+    } else if url.starts_with("http://") {
+        (url.trim_start_matches("http://").split('/').next().unwrap_or(url), 80)
+    } else {
+        // Assume it's a hostname/IP, try HTTPS first
+        (url.split('/').next().unwrap_or(url), 443)
+    };
+
+    // Remove port from host if included (e.g., "example.com:8080")
+    let (host, port) = if let Some(idx) = host.find(':') {
+        let custom_port = host[idx + 1..].parse().unwrap_or(port);
+        (&host[..idx], custom_port)
+    } else {
+        (host, port)
+    };
+
+    let addr = format!("{}:{}", host, port);
+
+    let result = timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await;
+
+    match result {
+        Ok(Ok(_)) => SiteStatus {
+            url: url.to_string(),
+            is_up: true,
+            latency_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
+            last_check: Utc::now(),
+            last_down: None,
+        },
+        _ => SiteStatus {
+            url: url.to_string(),
+            is_up: false,
+            latency_ms: None,
+            last_check: Utc::now(),
+            last_down: Some(Utc::now()),
+        },
+    }
+}
+
+/// Start the site monitor service - checks sites every 60 seconds
+fn start_site_monitor_service(app_handle: AppHandle, state: Arc<AppState>) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let monitors = state.site_monitors.lock().await.clone();
+
+            for monitor in monitors.iter().filter(|m| m.enabled) {
+                // Check previous status
+                let was_up = {
+                    let statuses = state.site_statuses.lock().await;
+                    statuses.get(&monitor.url).map(|s| s.is_up).unwrap_or(true)
+                };
+
+                // Check site
+                let status = check_site(&monitor.url).await;
+                let is_up = status.is_up;
+
+                // Update status with last_down from previous if site is now up
+                let final_status = if is_up {
+                    let prev_last_down = {
+                        let statuses = state.site_statuses.lock().await;
+                        statuses.get(&monitor.url).and_then(|s| s.last_down)
+                    };
+                    SiteStatus {
+                        last_down: prev_last_down,
+                        ..status
+                    }
+                } else {
+                    status
+                };
+
+                // Send notification if site went down
+                if was_up && !is_up {
+                    let site_name = monitor.name.as_deref().unwrap_or(&monitor.url);
+                    let _ = app_handle
+                        .notification()
+                        .builder()
+                        .title("Site Down Alert")
+                        .body(format!("{} is not responding", site_name))
+                        .show();
+                }
+
+                // Update status
+                state
+                    .site_statuses
+                    .lock()
+                    .await
+                    .insert(monitor.url.clone(), final_status);
+            }
+
+            // Emit event for frontend
+            let statuses = state.site_statuses.lock().await.clone();
+            let _ = app_handle.emit("site-status-update", &statuses);
+
+            // Sleep 60 seconds
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
 }
 
 /// Start the ping service background task - pings all targets
@@ -507,7 +754,8 @@ fn start_ping_service(app_handle: AppHandle, state: Arc<AppState>) {
                 let history = state.ping_history.lock().await;
                 let targets = state.targets.lock().await;
                 let primary = state.primary_target.lock().await;
-                let _ = save_history(&history, &targets, &primary);
+                let site_monitors = state.site_monitors.lock().await;
+                let _ = save_history(&history, &targets, &primary, &site_monitors);
             }
 
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -522,6 +770,8 @@ struct SavedData {
     targets: Vec<String>,
     primary_target: String,
     notification_threshold_ms: u32,
+    #[serde(default)]
+    site_monitors: Vec<SiteMonitor>,
 }
 
 /// Save history to disk
@@ -529,6 +779,7 @@ fn save_history(
     history: &HashMap<String, VecDeque<PingResult>>,
     targets: &[String],
     primary_target: &str,
+    site_monitors: &[SiteMonitor],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(data_dir) = dirs::data_dir() {
         let app_dir = data_dir.join("pingzilla");
@@ -539,6 +790,7 @@ fn save_history(
             targets: targets.to_vec(),
             primary_target: primary_target.to_string(),
             notification_threshold_ms: 400,
+            site_monitors: site_monitors.to_vec(),
         };
         let json = serde_json::to_string(&data)?;
         std::fs::write(file_path, json)?;
@@ -547,7 +799,7 @@ fn save_history(
 }
 
 /// Load history from disk
-fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String) {
+fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String, Vec<SiteMonitor>) {
     if let Some(data_dir) = dirs::data_dir() {
         // Try new format first
         let file_path_v2 = data_dir.join("pingzilla").join("history_v2.json");
@@ -563,7 +815,7 @@ fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String
                         (target, filtered)
                     })
                     .collect();
-                return (filtered_history, data.targets, data.primary_target);
+                return (filtered_history, data.targets, data.primary_target, data.site_monitors);
             }
         }
 
@@ -582,14 +834,14 @@ fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String
                     .unwrap_or_else(|| "1.1.1.1".to_string());
                 let mut map = HashMap::new();
                 map.insert(target.clone(), filtered);
-                return (map, vec![target.clone()], target);
+                return (map, vec![target.clone()], target, Vec::new());
             }
         }
     }
 
     let mut history = HashMap::new();
     history.insert("1.1.1.1".to_string(), VecDeque::new());
-    (history, vec!["1.1.1.1".to_string()], "1.1.1.1".to_string())
+    (history, vec!["1.1.1.1".to_string()], "1.1.1.1".to_string(), Vec::new())
 }
 
 /// Position window below tray icon (macOS)
@@ -630,12 +882,13 @@ fn position_window_at_tray(window: &tauri::WebviewWindow, tray_rect: tauri::Rect
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let (loaded_history, loaded_targets, loaded_primary) = load_history();
+    let (loaded_history, loaded_targets, loaded_primary, loaded_site_monitors) = load_history();
 
     let app_state = Arc::new(AppState {
         ping_history: Mutex::new(loaded_history),
         targets: Mutex::new(loaded_targets),
         primary_target: Mutex::new(loaded_primary),
+        site_monitors: Mutex::new(loaded_site_monitors),
         ..Default::default()
     });
 
@@ -658,6 +911,11 @@ pub fn run() {
             get_settings,
             get_statistics,
             set_display_mode,
+            get_my_ip_info,
+            get_site_monitors,
+            add_site_monitor,
+            remove_site_monitor,
+            get_site_statuses,
         ])
         .setup(move |app| {
             // Show in Dock - required for ping to work in sandboxed App Store builds
@@ -707,6 +965,7 @@ pub fn run() {
                 .build(app)?;
 
             start_ping_service(app.handle().clone(), app_state.clone());
+            start_site_monitor_service(app.handle().clone(), app_state.clone());
 
             Ok(())
         })
