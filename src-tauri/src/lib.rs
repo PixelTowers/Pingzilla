@@ -328,33 +328,43 @@ async fn do_tcp_ping(target: &str, port: u16) -> Option<f64> {
 }
 
 /// Perform a single ping using system ping command (no root needed)
+/// Uses tokio::process::Command for async execution with timeout to prevent
+/// blocking the runtime if sandbox denies ping execution
 async fn do_system_ping(target: &str) -> Option<f64> {
-    use std::process::Command;
+    use tokio::process::Command;
+    use tokio::time::timeout;
 
-    let output = Command::new("ping")
-        .args(["-c", "1", "-W", "2000", target])
-        .output()
-        .ok()?;
+    // 3-second timeout - if sandbox blocks ping, we move on quickly to TCP fallback
+    let result = timeout(Duration::from_secs(3), async {
+        let output = Command::new("ping")
+            .args(["-c", "1", "-W", "2000", target])
+            .output()
+            .await
+            .ok()?;
 
-    if !output.status.success() {
-        return None;
-    }
+        if !output.status.success() {
+            return None;
+        }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Parse "time=12.345 ms" from output
-    for line in stdout.lines() {
-        if let Some(time_idx) = line.find("time=") {
-            let time_str = &line[time_idx + 5..];
-            if let Some(ms_idx) = time_str.find(" ms") {
-                if let Ok(ms) = time_str[..ms_idx].parse::<f64>() {
-                    return Some(ms);
+        // Parse "time=12.345 ms" from output
+        for line in stdout.lines() {
+            if let Some(time_idx) = line.find("time=") {
+                let time_str = &line[time_idx + 5..];
+                if let Some(ms_idx) = time_str.find(" ms") {
+                    if let Ok(ms) = time_str[..ms_idx].parse::<f64>() {
+                        return Some(ms);
+                    }
                 }
             }
         }
-    }
 
-    None
+        None
+    })
+    .await;
+
+    result.ok().flatten()
 }
 
 /// Perform a ping with automatic fallback to TCP if system ping fails
