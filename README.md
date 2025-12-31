@@ -16,7 +16,10 @@ A lightweight macOS menu bar application that monitors your network latency in r
   - Angry (60-150ms) - Getting concerned...
   - Sad (> 150ms) - Network troubles!
   - Dead (timeout) - No response!
-- **Multiple Targets** - Monitor multiple hosts simultaneously with tabbed interface
+- **IP Geolocation** - See your public IP address and country with flag emoji - perfect for VPN users
+- **Site Monitoring** - Monitor up to 10 websites or servers with 60-second check intervals
+- **Down Alerts** - Get notified when monitored sites go down
+- **Multiple Targets** - Monitor multiple hosts simultaneously
 - **Statistics Dashboard** - View min/max/avg latency, uptime percentage, and packet loss
 - **Real-Time Graph** - Visual history of the last 2 minutes of ping data
 - **Display Mode Options** - Choose what to show in menu bar:
