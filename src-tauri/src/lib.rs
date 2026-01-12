@@ -4,6 +4,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{
@@ -15,6 +16,7 @@ use tauri::{
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::Mutex;
+
 
 /// A single ping measurement
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +73,81 @@ pub struct SiteStatus {
     pub last_down: Option<DateTime<Utc>>,
 }
 
+/// Network change type for VPN drop detection
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum NetworkChangeType {
+    IpChanged,
+    CountryChanged, // VPN likely dropped!
+    IspChanged,
+    Initial,
+}
+
+/// Network change event emitted when IP/country/ISP changes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkChangeEvent {
+    pub change_type: NetworkChangeType,
+    pub previous: Option<IpInfo>,
+    pub current: IpInfo,
+    pub timestamp: DateTime<Utc>,
+    pub is_expected: bool, // Manual refresh vs automatic
+}
+
+/// Network stability tracking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkStability {
+    pub changes_last_hour: u32,
+    pub last_country_change: Option<DateTime<Utc>>,
+    pub last_ip_change: Option<DateTime<Utc>>,
+}
+
+impl Default for NetworkStability {
+    fn default() -> Self {
+        Self {
+            changes_last_hour: 0,
+            last_country_change: None,
+            last_ip_change: None,
+        }
+    }
+}
+
+/// VPN protection settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VpnProtectionSettings {
+    pub enabled: bool,
+    pub check_interval_secs: u32,
+    pub alert_on_country_change: bool,
+    pub alert_on_ip_change: bool,
+    pub expected_country: Option<String>,
+}
+
+impl Default for VpnProtectionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_interval_secs: 60, // 60s default to save battery
+            alert_on_country_change: true,
+            alert_on_ip_change: true,
+            expected_country: None,
+        }
+    }
+}
+
+/// Cached tray state to avoid unnecessary updates
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrayState {
+    pub icon_type: TrayIconType,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrayIconType {
+    Happy,
+    Angry,
+    Sad,
+    Dead,
+    Transparent,
+}
+
 /// Application state shared across the app
 pub struct AppState {
     pub ping_history: Mutex<HashMap<String, VecDeque<PingResult>>>,
@@ -83,6 +160,17 @@ pub struct AppState {
     pub ip_info_last_check: Mutex<Option<DateTime<Utc>>>,
     pub site_monitors: Mutex<Vec<SiteMonitor>>,
     pub site_statuses: Mutex<HashMap<String, SiteStatus>>,
+    // VPN drop detection fields
+    pub vpn_settings: Mutex<VpnProtectionSettings>,
+    pub network_stability: Mutex<NetworkStability>,
+    pub network_change_history: Mutex<VecDeque<NetworkChangeEvent>>,
+    pub last_ip_check_was_manual: Mutex<bool>,
+    pub last_vpn_notification: Mutex<Option<DateTime<Utc>>>,
+    // Tray state cache to avoid unnecessary updates
+    pub last_tray_state: Mutex<Option<TrayState>>,
+    // Battery optimization: sleep/wake and visibility tracking
+    pub is_system_sleeping: AtomicBool,
+    pub is_window_visible: AtomicBool,
 }
 
 impl Default for AppState {
@@ -100,6 +188,17 @@ impl Default for AppState {
             ip_info_last_check: Mutex::new(None),
             site_monitors: Mutex::new(Vec::new()),
             site_statuses: Mutex::new(HashMap::new()),
+            // VPN drop detection defaults
+            vpn_settings: Mutex::new(VpnProtectionSettings::default()),
+            network_stability: Mutex::new(NetworkStability::default()),
+            network_change_history: Mutex::new(VecDeque::with_capacity(100)),
+            last_ip_check_was_manual: Mutex::new(false),
+            last_vpn_notification: Mutex::new(None),
+            // Tray state cache
+            last_tray_state: Mutex::new(None),
+            // Battery optimization defaults
+            is_system_sleeping: AtomicBool::new(false),
+            is_window_visible: AtomicBool::new(false),
         }
     }
 }
@@ -390,6 +489,134 @@ async fn get_my_ip_info(
     Ok(info)
 }
 
+/// Fetch IP info directly from API (no caching, for VPN monitoring)
+async fn fetch_ip_info_internal() -> Result<IpInfo, String> {
+    let resp = reqwest::get("http://ip-api.com/json/")
+        .await
+        .map_err(|e| format!("Failed to fetch IP info: {}", e))?;
+
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse IP info: {}", e))?;
+
+    Ok(IpInfo {
+        ip: data["query"].as_str().unwrap_or("Unknown").to_string(),
+        country: data["country"].as_str().unwrap_or("Unknown").to_string(),
+        country_code: data["countryCode"].as_str().unwrap_or("").to_string(),
+        city: data["city"].as_str().map(String::from),
+        isp: data["isp"].as_str().map(String::from),
+    })
+}
+
+/// Detect network changes between previous and current IP info
+fn detect_network_change(
+    prev: &IpInfo,
+    current: &IpInfo,
+    is_manual: bool,
+) -> Option<NetworkChangeEvent> {
+    // Check for country change (VPN dropped!)
+    if prev.country_code != current.country_code {
+        return Some(NetworkChangeEvent {
+            change_type: NetworkChangeType::CountryChanged,
+            previous: Some(prev.clone()),
+            current: current.clone(),
+            timestamp: Utc::now(),
+            is_expected: is_manual,
+        });
+    }
+
+    // Check for IP change (same country)
+    if prev.ip != current.ip {
+        return Some(NetworkChangeEvent {
+            change_type: NetworkChangeType::IpChanged,
+            previous: Some(prev.clone()),
+            current: current.clone(),
+            timestamp: Utc::now(),
+            is_expected: is_manual,
+        });
+    }
+
+    // Check for ISP change only
+    if prev.isp != current.isp {
+        return Some(NetworkChangeEvent {
+            change_type: NetworkChangeType::IspChanged,
+            previous: Some(prev.clone()),
+            current: current.clone(),
+            timestamp: Utc::now(),
+            is_expected: is_manual,
+        });
+    }
+
+    None
+}
+
+/// Check if we should send a VPN notification based on settings and rate limiting
+fn should_send_vpn_notification(
+    change: &NetworkChangeEvent,
+    settings: &VpnProtectionSettings,
+    last_notification: Option<DateTime<Utc>>,
+) -> bool {
+    // Don't notify for manual refreshes
+    if change.is_expected {
+        return false;
+    }
+
+    // Rate limit: max 1 notification per 30 seconds
+    if let Some(last) = last_notification {
+        if Utc::now().signed_duration_since(last).num_seconds() < 30 {
+            return false;
+        }
+    }
+
+    match change.change_type {
+        NetworkChangeType::CountryChanged => settings.alert_on_country_change,
+        NetworkChangeType::IpChanged => settings.alert_on_ip_change,
+        NetworkChangeType::IspChanged => false, // Never notify for ISP-only changes
+        NetworkChangeType::Initial => false,
+    }
+}
+
+/// Get VPN protection settings
+#[tauri::command]
+async fn get_vpn_settings(state: State<'_, Arc<AppState>>) -> Result<VpnProtectionSettings, String> {
+    let settings = state.vpn_settings.lock().await;
+    Ok(settings.clone())
+}
+
+/// Set VPN protection settings
+#[tauri::command]
+async fn set_vpn_settings(
+    settings: VpnProtectionSettings,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    *state.vpn_settings.lock().await = settings;
+    Ok(())
+}
+
+/// Get network stability info
+#[tauri::command]
+async fn get_network_stability(state: State<'_, Arc<AppState>>) -> Result<NetworkStability, String> {
+    let stability = state.network_stability.lock().await;
+    Ok(stability.clone())
+}
+
+/// Acknowledge and dismiss an IP change alert
+#[tauri::command]
+async fn acknowledge_ip_change(_state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    // Mark the current IP as the new baseline (no action needed for basic impl)
+    // The frontend will dismiss the alert banner
+    Ok(())
+}
+
+/// Set window visibility for adaptive ping interval (battery optimization)
+/// Called from frontend on focus/blur events
+#[tauri::command]
+async fn set_window_visible(visible: bool, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.is_window_visible.store(visible, Ordering::Relaxed);
+    Ok(())
+}
+
 /// Get all site monitors
 #[tauri::command]
 async fn get_site_monitors(state: State<'_, Arc<AppState>>) -> Result<Vec<SiteMonitor>, String> {
@@ -576,189 +803,373 @@ async fn check_site(url: &str) -> SiteStatus {
     }
 }
 
-/// Start the site monitor service - checks sites every 60 seconds
-fn start_site_monitor_service(app_handle: AppHandle, state: Arc<AppState>) {
-    tauri::async_runtime::spawn(async move {
-        loop {
-            let monitors = state.site_monitors.lock().await.clone();
+/// Check all monitored sites and return whether any status changed
+async fn check_all_sites(app_handle: &AppHandle, state: &Arc<AppState>) -> bool {
+    let monitors = state.site_monitors.lock().await.clone();
+    let mut any_changed = false;
 
-            for monitor in monitors.iter().filter(|m| m.enabled) {
-                // Check previous status
-                let was_up = {
-                    let statuses = state.site_statuses.lock().await;
-                    statuses.get(&monitor.url).map(|s| s.is_up).unwrap_or(true)
-                };
+    for monitor in monitors.iter().filter(|m| m.enabled) {
+        // Check previous status
+        let was_up = {
+            let statuses = state.site_statuses.lock().await;
+            statuses.get(&monitor.url).map(|s| s.is_up).unwrap_or(true)
+        };
 
-                // Check site
-                let status = check_site(&monitor.url).await;
-                let is_up = status.is_up;
+        // Check site
+        let status = check_site(&monitor.url).await;
+        let is_up = status.is_up;
 
-                // Update status with last_down from previous if site is now up
-                let final_status = if is_up {
-                    let prev_last_down = {
-                        let statuses = state.site_statuses.lock().await;
-                        statuses.get(&monitor.url).and_then(|s| s.last_down)
-                    };
-                    SiteStatus {
-                        last_down: prev_last_down,
-                        ..status
+        // Track if status changed
+        if was_up != is_up {
+            any_changed = true;
+        }
+
+        // Update status with last_down from previous if site is now up
+        let final_status = if is_up {
+            let prev_last_down = {
+                let statuses = state.site_statuses.lock().await;
+                statuses.get(&monitor.url).and_then(|s| s.last_down)
+            };
+            SiteStatus {
+                last_down: prev_last_down,
+                ..status
+            }
+        } else {
+            status
+        };
+
+        // Send notification if site went down
+        if was_up && !is_up {
+            let site_name = monitor.name.as_deref().unwrap_or(&monitor.url);
+            let _ = app_handle
+                .notification()
+                .builder()
+                .title("Site Down Alert")
+                .body(format!("{} is not responding", site_name))
+                .show();
+        }
+
+        // Update status
+        state
+            .site_statuses
+            .lock()
+            .await
+            .insert(monitor.url.clone(), final_status);
+    }
+
+    // Only emit event if something changed (saves CPU/battery)
+    if any_changed {
+        let statuses = state.site_statuses.lock().await.clone();
+        let _ = app_handle.emit("site-status-update", &statuses);
+    }
+
+    any_changed
+}
+
+/// Check IP for VPN drop detection
+async fn check_ip_change(app_handle: &AppHandle, state: &Arc<AppState>) {
+    let settings = state.vpn_settings.lock().await.clone();
+
+    // Skip if VPN protection is disabled
+    if !settings.enabled {
+        return;
+    }
+
+    // Fetch current IP (bypass cache)
+    if let Ok(current) = fetch_ip_info_internal().await {
+        let previous = state.ip_info.lock().await.clone();
+        let is_manual = *state.last_ip_check_was_manual.lock().await;
+        *state.last_ip_check_was_manual.lock().await = false;
+
+        // Detect changes if we have a previous IP
+        if let Some(prev) = &previous {
+            if let Some(change) = detect_network_change(prev, &current, is_manual) {
+                // Emit event to frontend
+                let _ = app_handle.emit("network-change", &change);
+
+                // Update network stability tracking
+                {
+                    let mut stability = state.network_stability.lock().await;
+                    match change.change_type {
+                        NetworkChangeType::CountryChanged => {
+                            stability.last_country_change = Some(Utc::now());
+                            stability.changes_last_hour += 1;
+                        }
+                        NetworkChangeType::IpChanged => {
+                            stability.last_ip_change = Some(Utc::now());
+                            stability.changes_last_hour += 1;
+                        }
+                        _ => {}
                     }
-                } else {
-                    status
-                };
+                }
 
-                // Send notification if site went down
-                if was_up && !is_up {
-                    let site_name = monitor.name.as_deref().unwrap_or(&monitor.url);
+                // Add to change history
+                {
+                    let mut history = state.network_change_history.lock().await;
+                    history.push_back(change.clone());
+                    // Keep last 100 changes
+                    if history.len() > 100 {
+                        history.pop_front();
+                    }
+                }
+
+                // Send notification for critical changes
+                let last_notif = *state.last_vpn_notification.lock().await;
+                if should_send_vpn_notification(&change, &settings, last_notif) {
+                    let (title, body) = match change.change_type {
+                        NetworkChangeType::CountryChanged => (
+                            "VPN Alert: Location Changed!",
+                            format!(
+                                "{} → {}. Check your VPN connection.",
+                                prev.country, current.country
+                            ),
+                        ),
+                        NetworkChangeType::IpChanged => (
+                            "Network: IP Changed",
+                            format!("Your IP address changed to {}", current.ip),
+                        ),
+                        _ => ("Network Change", "Network configuration changed".to_string()),
+                    };
+
                     let _ = app_handle
                         .notification()
                         .builder()
-                        .title("Site Down Alert")
-                        .body(format!("{} is not responding", site_name))
+                        .title(title)
+                        .body(body)
                         .show();
+
+                    *state.last_vpn_notification.lock().await = Some(Utc::now());
                 }
-
-                // Update status
-                state
-                    .site_statuses
-                    .lock()
-                    .await
-                    .insert(monitor.url.clone(), final_status);
             }
-
-            // Emit event for frontend
-            let statuses = state.site_statuses.lock().await.clone();
-            let _ = app_handle.emit("site-status-update", &statuses);
-
-            // Sleep 60 seconds
-            tokio::time::sleep(Duration::from_secs(60)).await;
         }
-    });
+
+        // Update current IP state
+        *state.ip_info.lock().await = Some(current);
+        *state.ip_info_last_check.lock().await = Some(Utc::now());
+    }
 }
 
-/// Start the ping service background task - pings all targets
-fn start_ping_service(app_handle: AppHandle, state: Arc<AppState>) {
+/// Determine which icon type to use based on latency
+fn get_icon_type_for_latency(latency_ms: Option<f64>) -> TrayIconType {
+    match latency_ms {
+        Some(ms) if ms < 60.0 => TrayIconType::Happy,
+        Some(ms) if ms < 150.0 => TrayIconType::Angry,
+        Some(_) => TrayIconType::Sad,
+        None => TrayIconType::Dead,
+    }
+}
+
+/// Update tray only if state has changed (saves CPU/battery)
+fn update_tray_if_changed(
+    tray: &tauri::tray::TrayIcon,
+    new_state: &TrayState,
+    last_state: &mut Option<TrayState>,
+    display_mode: &DisplayMode,
+    // Pre-loaded icons to avoid repeated PNG decoding
+    icons: &TrayIcons,
+) {
+    // Skip update if nothing changed
+    if let Some(ref last) = last_state {
+        if last == new_state {
+            return;
+        }
+    }
+
+    // Get the right icon bytes
+    let icon_bytes = match new_state.icon_type {
+        TrayIconType::Happy => icons.happy,
+        TrayIconType::Angry => icons.angry,
+        TrayIconType::Sad => icons.sad,
+        TrayIconType::Dead => icons.dead,
+        TrayIconType::Transparent => icons.transparent,
+    };
+
+    match display_mode {
+        DisplayMode::IconOnly => {
+            if let Ok(icon) = Image::from_bytes(icon_bytes) {
+                let _ = tray.set_icon(Some(icon));
+                let _ = tray.set_icon_as_template(true);
+            }
+            let _ = tray.set_title(Some(""));
+        }
+        DisplayMode::IconAndPing => {
+            if let Ok(icon) = Image::from_bytes(icon_bytes) {
+                let _ = tray.set_icon(Some(icon));
+                let _ = tray.set_icon_as_template(true);
+            }
+            let _ = tray.set_title(Some(&new_state.title));
+        }
+        DisplayMode::PingOnly => {
+            if let Ok(icon) = Image::from_bytes(icons.transparent) {
+                let _ = tray.set_icon(Some(icon));
+                let _ = tray.set_icon_as_template(true);
+            }
+            let _ = tray.set_title(Some(&new_state.title));
+        }
+    }
+
+    *last_state = Some(new_state.clone());
+}
+
+/// Pre-loaded icon bytes to avoid repeated include_bytes! calls
+struct TrayIcons {
+    happy: &'static [u8],
+    angry: &'static [u8],
+    sad: &'static [u8],
+    dead: &'static [u8],
+    transparent: &'static [u8],
+}
+
+/// Save history to disk asynchronously (non-blocking)
+async fn save_history_async(state: &Arc<AppState>) {
+    let history = state.ping_history.lock().await.clone();
+    let targets = state.targets.lock().await.clone();
+    let primary = state.primary_target.lock().await.clone();
+    let site_monitors = state.site_monitors.lock().await.clone();
+    let vpn_settings = state.vpn_settings.lock().await.clone();
+
+    // Spawn blocking file I/O in a separate thread to not block async runtime
+    let _ = tokio::task::spawn_blocking(move || {
+        // Ignore error - can't send Box<dyn Error> across threads
+        let _ = save_history(&history, &targets, &primary, &site_monitors, &vpn_settings);
+    })
+    .await;
+}
+
+/// Unified background service - consolidates ping, site monitoring, and VPN check into ONE timer
+/// This dramatically reduces CPU wake-ups (from 3 independent timers to 1)
+/// Battery optimization: adaptive interval (10s visible, 30s hidden), pauses during system sleep
+fn start_unified_background_service(app_handle: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
-        let mut save_counter = 0u32;
+        let mut tick_count = 0u64;
+        let mut last_interval_secs = 10u64; // Track for consistent tick calculations
+
+        // Pre-load icons once (not on every ping!)
+        let icons = TrayIcons {
+            happy: include_bytes!("../icons/pingzilla_happy.png"),
+            angry: include_bytes!("../icons/pinzilla_angry.png"),
+            sad: include_bytes!("../icons/pingzilla_sad.png"),
+            dead: include_bytes!("../icons/pingzilla_dead.png"),
+            transparent: include_bytes!("../icons/transparent.png"),
+        };
 
         loop {
-            let targets = state.targets.lock().await.clone();
-            let primary_target = state.primary_target.lock().await.clone();
+            // === SLEEP CHECK: Skip all work if system is sleeping ===
+            if state.is_system_sleeping.load(Ordering::Relaxed) {
+                // Wait briefly and check again - don't do any work
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
 
-            for target in &targets {
-                let latency_ms = do_ping(target).await;
+            tick_count += 1;
 
-                let result = PingResult {
-                    timestamp: Utc::now(),
-                    latency_ms,
-                    target: target.clone(),
-                };
+            // === PING (every tick) ===
+            {
+                let targets = state.targets.lock().await.clone();
+                let primary_target = state.primary_target.lock().await.clone();
 
-                {
-                    let mut history = state.ping_history.lock().await;
-                    let target_history = history
-                        .entry(target.clone())
-                        .or_insert_with(|| VecDeque::with_capacity(1000));
-                    target_history.push_back(result.clone());
-                    while target_history.len() > 43200 {
-                        target_history.pop_front();
-                    }
-                }
+                for target in &targets {
+                    let latency_ms = do_ping(target).await;
 
-                // Update tray only for primary target
-                if target == &primary_target {
-                    let display_mode = state.display_mode.lock().await.clone();
+                    let result = PingResult {
+                        timestamp: Utc::now(),
+                        latency_ms,
+                        target: target.clone(),
+                    };
 
-                    if let Some(tray) = app_handle.tray_by_id("main-tray") {
-                        let ping_text = match latency_ms {
-                            Some(ms) => format!("{:.0}ms", ms),
-                            None => "---".to_string(),
-                        };
-
-                        // Load Godzilla icons based on latency
-                        let icon_happy = include_bytes!("../icons/pingzilla_happy.png");
-                        let icon_angry = include_bytes!("../icons/pinzilla_angry.png");
-                        let icon_sad = include_bytes!("../icons/pingzilla_sad.png");
-                        let icon_dead = include_bytes!("../icons/pingzilla_dead.png");
-                        let transparent_bytes = include_bytes!("../icons/transparent.png");
-
-                        // Choose icon based on latency
-                        let status_icon = match latency_ms {
-                            Some(ms) if ms < 60.0 => icon_happy.as_slice(),
-                            Some(ms) if ms < 150.0 => icon_angry.as_slice(),
-                            Some(_) => icon_sad.as_slice(),
-                            None => icon_dead.as_slice(),
-                        };
-
-                        match display_mode {
-                            DisplayMode::IconOnly => {
-                                // Show icon, hide text
-                                if let Ok(icon) = Image::from_bytes(status_icon) {
-                                    let _ = tray.set_icon(Some(icon));
-                                    let _ = tray.set_icon_as_template(true);
-                                }
-                                let _ = tray.set_title(Some(""));
-                            }
-                            DisplayMode::IconAndPing => {
-                                // Show both icon and ping text
-                                if let Ok(icon) = Image::from_bytes(status_icon) {
-                                    let _ = tray.set_icon(Some(icon));
-                                    let _ = tray.set_icon_as_template(true);
-                                }
-                                let _ = tray.set_title(Some(&ping_text));
-                            }
-                            DisplayMode::PingOnly => {
-                                // Hide icon, show only ping text
-                                if let Ok(icon) = Image::from_bytes(transparent_bytes) {
-                                    let _ = tray.set_icon(Some(icon));
-                                    let _ = tray.set_icon_as_template(true);
-                                }
-                                let _ = tray.set_title(Some(&ping_text));
-                            }
+                    {
+                        let mut history = state.ping_history.lock().await;
+                        let target_history = history
+                            .entry(target.clone())
+                            .or_insert_with(|| VecDeque::with_capacity(1000));
+                        target_history.push_back(result.clone());
+                        // Keep 24 hours worth (varies by interval, use conservative estimate)
+                        while target_history.len() > 8640 {
+                            target_history.pop_front();
                         }
                     }
-                }
 
-                let _ = app_handle.emit("ping-update", &result);
+                    // Update tray only for primary target
+                    if target == &primary_target {
+                        let display_mode = state.display_mode.lock().await.clone();
 
-                // Notifications for primary target only
-                if target == &primary_target {
-                    if let Some(ms) = latency_ms {
-                        let threshold = *state.notification_threshold_ms.lock().await;
-                        if ms > threshold as f64 {
-                            let mut last_notif = state.last_notification.lock().await;
-                            let should_notify = match *last_notif {
-                                Some(last) => {
-                                    Utc::now().signed_duration_since(last).num_seconds() > 60
-                                }
-                                None => true,
+                        if let Some(tray) = app_handle.tray_by_id("main-tray") {
+                            let ping_text = match latency_ms {
+                                Some(ms) => format!("{:.0}ms", ms),
+                                None => "---".to_string(),
                             };
 
-                            if should_notify {
-                                *last_notif = Some(Utc::now());
-                                let _ = app_handle
-                                    .notification()
-                                    .builder()
-                                    .title("PingZilla Alert")
-                                    .body(format!("High latency detected: {:.0}ms", ms))
-                                    .show();
+                            let icon_type = match &display_mode {
+                                DisplayMode::PingOnly => TrayIconType::Transparent,
+                                _ => get_icon_type_for_latency(latency_ms),
+                            };
+
+                            let new_state = TrayState {
+                                icon_type,
+                                title: ping_text,
+                            };
+
+                            let mut last_state = state.last_tray_state.lock().await;
+                            update_tray_if_changed(&tray, &new_state, &mut last_state, &display_mode, &icons);
+                        }
+                    }
+
+                    let _ = app_handle.emit("ping-update", &result);
+
+                    // Notifications for primary target only
+                    if target == &primary_target {
+                        if let Some(ms) = latency_ms {
+                            let threshold = *state.notification_threshold_ms.lock().await;
+                            if ms > threshold as f64 {
+                                let mut last_notif = state.last_notification.lock().await;
+                                let should_notify = match *last_notif {
+                                    Some(last) => {
+                                        Utc::now().signed_duration_since(last).num_seconds() > 60
+                                    }
+                                    None => true,
+                                };
+
+                                if should_notify {
+                                    *last_notif = Some(Utc::now());
+                                    let _ = app_handle
+                                        .notification()
+                                        .builder()
+                                        .title("PingZilla Alert")
+                                        .body(format!("High latency detected: {:.0}ms", ms))
+                                        .show();
+                                }
                             }
                         }
                     }
                 }
             }
 
-            save_counter += 1;
-            if save_counter >= 30 {
-                save_counter = 0;
-                let history = state.ping_history.lock().await;
-                let targets = state.targets.lock().await;
-                let primary = state.primary_target.lock().await;
-                let site_monitors = state.site_monitors.lock().await;
-                let _ = save_history(&history, &targets, &primary, &site_monitors);
+            // === SITE MONITORING (every ~60 seconds) ===
+            // At 10s interval: tick 6, 12, 18... At 30s interval: tick 2, 4, 6...
+            let site_check_interval = if last_interval_secs == 10 { 6 } else { 2 };
+            if tick_count % site_check_interval == 0 {
+                let _ = check_all_sites(&app_handle, &state).await;
             }
 
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // === VPN/IP CHECK (every ~60 seconds, offset) ===
+            let vpn_check_interval = if last_interval_secs == 10 { 6 } else { 2 };
+            let vpn_offset = if last_interval_secs == 10 { 3 } else { 1 };
+            if tick_count % vpn_check_interval == vpn_offset {
+                check_ip_change(&app_handle, &state).await;
+            }
+
+            // === SAVE HISTORY (every ~5 minutes) ===
+            let save_interval = if last_interval_secs == 10 { 30 } else { 10 };
+            if tick_count % save_interval == 0 {
+                save_history_async(&state).await;
+            }
+
+            // === ADAPTIVE INTERVAL: 10s when visible, 30s when hidden ===
+            let is_visible = state.is_window_visible.load(Ordering::Relaxed);
+            let interval_secs = if is_visible { 10 } else { 30 };
+            last_interval_secs = interval_secs;
+
+            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
         }
     });
 }
@@ -772,6 +1183,8 @@ struct SavedData {
     notification_threshold_ms: u32,
     #[serde(default)]
     site_monitors: Vec<SiteMonitor>,
+    #[serde(default)]
+    vpn_settings: VpnProtectionSettings,
 }
 
 /// Save history to disk
@@ -780,6 +1193,7 @@ fn save_history(
     targets: &[String],
     primary_target: &str,
     site_monitors: &[SiteMonitor],
+    vpn_settings: &VpnProtectionSettings,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(data_dir) = dirs::data_dir() {
         let app_dir = data_dir.join("pingzilla");
@@ -791,6 +1205,7 @@ fn save_history(
             primary_target: primary_target.to_string(),
             notification_threshold_ms: 400,
             site_monitors: site_monitors.to_vec(),
+            vpn_settings: vpn_settings.clone(),
         };
         let json = serde_json::to_string(&data)?;
         std::fs::write(file_path, json)?;
@@ -799,7 +1214,7 @@ fn save_history(
 }
 
 /// Load history from disk
-fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String, Vec<SiteMonitor>) {
+fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String, Vec<SiteMonitor>, VpnProtectionSettings) {
     if let Some(data_dir) = dirs::data_dir() {
         // Try new format first
         let file_path_v2 = data_dir.join("pingzilla").join("history_v2.json");
@@ -815,7 +1230,7 @@ fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String
                         (target, filtered)
                     })
                     .collect();
-                return (filtered_history, data.targets, data.primary_target, data.site_monitors);
+                return (filtered_history, data.targets, data.primary_target, data.site_monitors, data.vpn_settings);
             }
         }
 
@@ -834,14 +1249,14 @@ fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String
                     .unwrap_or_else(|| "1.1.1.1".to_string());
                 let mut map = HashMap::new();
                 map.insert(target.clone(), filtered);
-                return (map, vec![target.clone()], target, Vec::new());
+                return (map, vec![target.clone()], target, Vec::new(), VpnProtectionSettings::default());
             }
         }
     }
 
     let mut history = HashMap::new();
     history.insert("1.1.1.1".to_string(), VecDeque::new());
-    (history, vec!["1.1.1.1".to_string()], "1.1.1.1".to_string(), Vec::new())
+    (history, vec!["1.1.1.1".to_string()], "1.1.1.1".to_string(), Vec::new(), VpnProtectionSettings::default())
 }
 
 /// Position window below tray icon (macOS)
@@ -880,15 +1295,60 @@ fn position_window_at_tray(window: &tauri::WebviewWindow, tray_rect: tauri::Rect
     let _ = window.set_position(tauri::LogicalPosition::new(x, y));
 }
 
+/// Register for macOS sleep/wake notifications to pause background service during sleep
+/// This is critical for battery optimization - without this, the app drains battery while laptop sleeps
+#[cfg(target_os = "macos")]
+fn register_sleep_wake_observer(_state: Arc<AppState>) {
+    // Note: Full sleep/wake notification requires complex objc2 block setup
+    // For now, the adaptive interval (30s when hidden) provides significant battery savings
+    // The is_system_sleeping flag is available for future implementation
+    // TODO: Implement proper NSWorkspaceWillSleepNotification observer
+}
+
+#[cfg(not(target_os = "macos"))]
+fn register_sleep_wake_observer(_state: Arc<AppState>) {
+    // No-op on non-macOS platforms
+}
+
+/// Disable App Nap for consistent timer behavior
+/// Without this, macOS throttles background apps, making timers unreliable
+#[cfg(target_os = "macos")]
+fn disable_app_nap() {
+    use objc2::msg_send;
+    use objc2::runtime::AnyClass;
+    use objc2_foundation::NSActivityOptions;
+
+    unsafe {
+        // Get NSProcessInfo class
+        let process_info_class = AnyClass::get("NSProcessInfo").unwrap();
+        let process_info: *mut objc2::runtime::AnyObject = msg_send![process_info_class, processInfo];
+
+        // Create the reason string
+        let reason_str = objc2_foundation::ns_string!("Network monitoring service");
+
+        // NSActivityUserInitiatedAllowingIdleSystemSleep = 0x00FFFFF
+        // This tells macOS: "I'm doing important work, don't throttle me, but you can still sleep"
+        let options = NSActivityOptions(0x00FFFFF);
+
+        let _: *mut objc2::runtime::AnyObject = msg_send![process_info, beginActivityWithOptions:options reason:reason_str];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn disable_app_nap() {
+    // No-op on non-macOS platforms
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let (loaded_history, loaded_targets, loaded_primary, loaded_site_monitors) = load_history();
+    let (loaded_history, loaded_targets, loaded_primary, loaded_site_monitors, loaded_vpn_settings) = load_history();
 
     let app_state = Arc::new(AppState {
         ping_history: Mutex::new(loaded_history),
         targets: Mutex::new(loaded_targets),
         primary_target: Mutex::new(loaded_primary),
         site_monitors: Mutex::new(loaded_site_monitors),
+        vpn_settings: Mutex::new(loaded_vpn_settings),
         ..Default::default()
     });
 
@@ -916,6 +1376,11 @@ pub fn run() {
             add_site_monitor,
             remove_site_monitor,
             get_site_statuses,
+            get_vpn_settings,
+            set_vpn_settings,
+            get_network_stability,
+            acknowledge_ip_change,
+            set_window_visible,
         ])
         .setup(move |app| {
             // Show in Dock - required for ping to work in sandboxed App Store builds
@@ -964,8 +1429,13 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            start_ping_service(app.handle().clone(), app_state.clone());
-            start_site_monitor_service(app.handle().clone(), app_state.clone());
+            // Battery optimizations: disable App Nap and register for sleep/wake
+            disable_app_nap();
+            register_sleep_wake_observer(app_state.clone());
+
+            // Single unified background service for battery efficiency
+            // Consolidates ping, site monitoring, and VPN check into ONE timer
+            start_unified_background_service(app.handle().clone(), app_state.clone());
 
             Ok(())
         })

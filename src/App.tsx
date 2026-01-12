@@ -103,6 +103,25 @@ interface SiteStatus {
   last_down: string | null;
 }
 
+// VPN drop detection types
+type NetworkChangeType = "IpChanged" | "CountryChanged" | "IspChanged" | "Initial";
+
+interface NetworkChangeEvent {
+  change_type: NetworkChangeType;
+  previous: IpInfo | null;
+  current: IpInfo;
+  timestamp: string;
+  is_expected: boolean;
+}
+
+interface VpnProtectionSettings {
+  enabled: boolean;
+  check_interval_secs: number;
+  alert_on_country_change: boolean;
+  alert_on_ip_change: boolean;
+  expected_country: string | null;
+}
+
 type DisplayMode = "icon_only" | "icon_and_ping" | "ping_only";
 
 // Convert country code to flag emoji
@@ -133,6 +152,16 @@ function App() {
   const [showAddSite, setShowAddSite] = useState(false);
   const [newSiteUrl, setNewSiteUrl] = useState("");
   const [newSiteName, setNewSiteName] = useState("");
+  // VPN drop detection state
+  const [vpnSettings, setVpnSettings] = useState<VpnProtectionSettings>({
+    enabled: true,
+    check_interval_secs: 30,
+    alert_on_country_change: true,
+    alert_on_ip_change: true,
+    expected_country: null,
+  });
+  const [networkAlert, setNetworkAlert] = useState<NetworkChangeEvent | null>(null);
+  const [showVpnSettings, setShowVpnSettings] = useState(false);
 
   // Load initial data and settings
   useEffect(() => {
@@ -195,12 +224,43 @@ function App() {
         } catch (e) {
           console.error("Failed to load site monitors:", e);
         }
+
+        // Load VPN protection settings
+        try {
+          const loadedVpnSettings = await invoke<VpnProtectionSettings>("get_vpn_settings");
+          setVpnSettings(loadedVpnSettings);
+        } catch (e) {
+          console.error("Failed to load VPN settings:", e);
+        }
       } catch (e) {
         console.error("Failed to load initial data:", e);
       }
     };
 
     loadData();
+  }, []);
+
+  // Track window visibility for adaptive ping interval (battery optimization)
+  useEffect(() => {
+    const handleFocus = () => {
+      invoke('set_window_visible', { visible: true }).catch(console.error);
+    };
+    const handleBlur = () => {
+      invoke('set_window_visible', { visible: false }).catch(console.error);
+    };
+
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('blur', handleBlur);
+
+    // Set initial state based on document focus
+    if (document.hasFocus()) {
+      handleFocus();
+    }
+
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('blur', handleBlur);
+    };
   }, []);
 
   // Load statistics when active target or period changes
@@ -266,6 +326,23 @@ function App() {
     };
   }, []);
 
+  // Listen for network change events (VPN drop detection)
+  useEffect(() => {
+    const unlisten = listen<NetworkChangeEvent>("network-change", (event) => {
+      const change = event.payload;
+      // Show alert for unexpected country changes (VPN dropped!)
+      if (!change.is_expected && change.change_type === "CountryChanged") {
+        setNetworkAlert(change);
+      }
+      // Update IP info with current values
+      setIpInfo(change.current);
+    });
+
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
   const refreshIpInfo = useCallback(async () => {
     setIpLoading(true);
     try {
@@ -307,6 +384,24 @@ function App() {
       });
     } catch (e) {
       console.error("Failed to remove site monitor:", e);
+    }
+  }, []);
+
+  const acknowledgeNetworkAlert = useCallback(async () => {
+    try {
+      await invoke("acknowledge_ip_change");
+      setNetworkAlert(null);
+    } catch (e) {
+      console.error("Failed to acknowledge network alert:", e);
+    }
+  }, []);
+
+  const updateVpnSettings = useCallback(async (newSettings: VpnProtectionSettings) => {
+    try {
+      await invoke("set_vpn_settings", { settings: newSettings });
+      setVpnSettings(newSettings);
+    } catch (e) {
+      console.error("Failed to update VPN settings:", e);
     }
   }, []);
 
@@ -367,11 +462,19 @@ function App() {
 
       {/* IP Info Bar */}
       {ipInfo && (
-        <div className="ip-info-bar">
+        <div className={`ip-info-bar ${networkAlert ? "alert" : ""}`}>
+          {networkAlert && <span className="vpn-alert-icon" title="Network change detected!">⚠️</span>}
           <span className="ip-label">Your IP</span>
           <span className="ip-flag">{countryCodeToFlag(ipInfo.country_code)}</span>
           <span className="ip-address">{ipInfo.ip}</span>
           <span className="ip-country">{ipInfo.country}</span>
+          <button
+            className={`vpn-settings-btn ${vpnSettings.enabled ? "active" : ""}`}
+            onClick={() => setShowVpnSettings(!showVpnSettings)}
+            title="VPN Protection Settings"
+          >
+            🛡️
+          </button>
           <button
             className="ip-refresh-btn"
             onClick={refreshIpInfo}
@@ -383,6 +486,82 @@ function App() {
         </div>
       )}
 
+      {/* VPN Alert Banner */}
+      {networkAlert && (
+        <div className="vpn-alert-banner">
+          <div className="alert-icon">🚨</div>
+          <div className="alert-content">
+            <div className="alert-title">VPN Connection May Have Dropped!</div>
+            <div className="alert-details">
+              {networkAlert.previous && (
+                <>
+                  {countryCodeToFlag(networkAlert.previous.country_code)} {networkAlert.previous.country}
+                  {" → "}
+                  {countryCodeToFlag(networkAlert.current.country_code)} {networkAlert.current.country}
+                </>
+              )}
+            </div>
+          </div>
+          <button className="alert-dismiss" onClick={acknowledgeNetworkAlert}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* VPN Settings Panel */}
+      {showVpnSettings && (
+        <div className="vpn-settings-panel">
+          <div className="setting-row">
+            <label>VPN Protection:</label>
+            <button
+              className={`toggle-btn ${vpnSettings.enabled ? "active" : ""}`}
+              onClick={() => updateVpnSettings({ ...vpnSettings, enabled: !vpnSettings.enabled })}
+            >
+              {vpnSettings.enabled ? "On" : "Off"}
+            </button>
+          </div>
+          <div className="setting-row">
+            <label>Check interval:</label>
+            <select
+              className="display-mode-select"
+              value={vpnSettings.check_interval_secs}
+              onChange={(e) =>
+                updateVpnSettings({ ...vpnSettings, check_interval_secs: parseInt(e.target.value) })
+              }
+            >
+              <option value={15}>15 sec</option>
+              <option value={30}>30 sec</option>
+              <option value={60}>1 min</option>
+              <option value={120}>2 min</option>
+            </select>
+          </div>
+          <div className="setting-row">
+            <label>Alert on country change:</label>
+            <button
+              className={`toggle-btn ${vpnSettings.alert_on_country_change ? "active" : ""}`}
+              onClick={() =>
+                updateVpnSettings({
+                  ...vpnSettings,
+                  alert_on_country_change: !vpnSettings.alert_on_country_change,
+                })
+              }
+            >
+              {vpnSettings.alert_on_country_change ? "On" : "Off"}
+            </button>
+          </div>
+          <div className="setting-row">
+            <label>Alert on IP change:</label>
+            <button
+              className={`toggle-btn ${vpnSettings.alert_on_ip_change ? "active" : ""}`}
+              onClick={() =>
+                updateVpnSettings({ ...vpnSettings, alert_on_ip_change: !vpnSettings.alert_on_ip_change })
+              }
+            >
+              {vpnSettings.alert_on_ip_change ? "On" : "Off"}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Settings Panel */}
       {showSettings && (

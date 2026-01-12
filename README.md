@@ -6,6 +6,12 @@
   <img src="src-tauri/icons/icon.png" width="128" alt="PingZilla App Icon">
 </p>
 
+<p align="center">
+  <a href="https://apps.apple.com/app/pingzilla/id6757017560">
+    <img src="https://tools.applemediaservices.com/api/badges/download-on-the-mac-app-store/black/en-us?size=250x83" alt="Download on the Mac App Store" height="50">
+  </a>
+</p>
+
 A lightweight macOS menu bar application that monitors your network latency in real-time. Built with Tauri 2, React, and Rust.
 
 ## Features
@@ -56,6 +62,14 @@ PingZilla uses expressive icons to show network health at a glance:
 </p>
 
 ## Installation
+
+### Mac App Store (Recommended)
+
+<a href="https://apps.apple.com/app/pingzilla/id6757017560">
+  <img src="https://tools.applemediaservices.com/api/badges/download-on-the-mac-app-store/black/en-us?size=250x83" alt="Download on the Mac App Store" height="40">
+</a>
+
+The easiest way to install PingZilla with automatic updates.
 
 ### From Release
 
