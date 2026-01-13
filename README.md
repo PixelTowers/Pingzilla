@@ -14,6 +14,17 @@
 
 A lightweight macOS menu bar application that monitors your network latency in real-time. Built with Tauri 2, React, and Rust.
 
+## Why PingZilla?
+
+**For Remote Workers & Digital Nomads**
+> Working from a café in Lisbon? PingZilla alerts you the moment your VPN drops, before your real IP gets exposed. See your current country right in the menu bar.
+
+**For Gamers & Streamers**
+> That lag spike just cost you the match. PingZilla lives in your menu bar showing real-time latency. Green means go, red means rage quit.
+
+**For Developers**
+> A menu bar ping monitor that doesn't eat your battery. Built with Tauri 2 and Rust, not another Electron memory hog. [Open source](https://github.com/PiXeL16/Pingzilla).
+
 ## Features
 
 - **Live Menu Bar Display** - Current ping displayed right in your menu bar
@@ -167,6 +178,10 @@ Run `make help` to see all available commands:
 | Yellow | 60-150ms   | Good      |
 | Red    | > 150ms    | Poor      |
 | Gray   | Timeout    | No response |
+
+## Documentation
+
+- [Marketing Plan](MarketingPlan.md) - Launch strategy and growth plans
 
 ## License
 
