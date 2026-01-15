@@ -61,10 +61,13 @@ function AnimatedNumber({ value, duration = 300 }: { value: number | null; durat
   return <>{displayValue !== null ? displayValue : "---"}</>;
 }
 
+type PingMethod = "Icmp" | "TcpDns" | "TcpHttps" | "TcpHttp";
+
 interface PingResult {
   timestamp: string;
   latency_ms: number | null;
   target: string;
+  method: PingMethod | null;
 }
 
 interface PingStatistics {
@@ -124,6 +127,18 @@ interface VpnProtectionSettings {
 
 type DisplayMode = "icon_only" | "icon_and_ping" | "ping_only";
 
+// View mode for window type detection (dashboard vs settings)
+type ViewMode = "dashboard" | "settings" | "full";
+
+// Get view mode from URL params (e.g., index.html?view=dashboard)
+const getViewMode = (): ViewMode => {
+  const params = new URLSearchParams(window.location.search);
+  const view = params.get("view");
+  if (view === "dashboard") return "dashboard";
+  if (view === "settings") return "settings";
+  return "full"; // Default: show everything (for compatibility)
+};
+
 // Convert country code to flag emoji
 const countryCodeToFlag = (code: string): string => {
   if (!code || code.length !== 2) return "";
@@ -135,9 +150,13 @@ const countryCodeToFlag = (code: string): string => {
 };
 
 function App() {
+  // Detect view mode from URL params
+  const viewMode = getViewMode();
+
   const [targets, setTargets] = useState<string[]>(["1.1.1.1"]);
   const [activeTarget, setActiveTarget] = useState("1.1.1.1");
   const [currentPings, setCurrentPings] = useState<Record<string, number | null>>({});
+  const [currentMethods, setCurrentMethods] = useState<Record<string, PingMethod | null>>({});
   const [histories, setHistories] = useState<Record<string, ChartData[]>>({});
   const [statistics, setStatistics] = useState<PingStatistics | null>(null);
   const [statsPeriod, setStatsPeriod] = useState(5); // minutes
@@ -162,6 +181,8 @@ function App() {
   });
   const [networkAlert, setNetworkAlert] = useState<NetworkChangeEvent | null>(null);
   const [showVpnSettings, setShowVpnSettings] = useState(false);
+  // Ping interval setting (in seconds)
+  const [pingInterval, setPingInterval] = useState(10);
 
   // Load initial data and settings
   useEffect(() => {
@@ -232,6 +253,14 @@ function App() {
         } catch (e) {
           console.error("Failed to load VPN settings:", e);
         }
+
+        // Load ping interval setting
+        try {
+          const loadedPingInterval = await invoke<number>("get_ping_interval");
+          setPingInterval(loadedPingInterval);
+        } catch (e) {
+          console.error("Failed to load ping interval:", e);
+        }
       } catch (e) {
         console.error("Failed to load initial data:", e);
       }
@@ -290,6 +319,11 @@ function App() {
       setCurrentPings((prev) => ({
         ...prev,
         [result.target]: result.latency_ms,
+      }));
+
+      setCurrentMethods((prev) => ({
+        ...prev,
+        [result.target]: result.method,
       }));
 
       setHistories((prev) => {
@@ -409,11 +443,12 @@ function App() {
     try {
       await invoke("set_notification_threshold", { thresholdMs: threshold });
       await invoke("set_display_mode", { mode: displayMode });
+      await invoke("set_ping_interval", { interval_secs: pingInterval });
       setShowSettings(false);
     } catch (e) {
       console.error("Failed to save settings:", e);
     }
-  }, [threshold, displayMode]);
+  }, [threshold, displayMode, pingInterval]);
 
   const toggleLaunchAtLogin = useCallback(async () => {
     try {
@@ -445,19 +480,28 @@ function App() {
   };
 
   const currentPing = currentPings[activeTarget] ?? null;
+  const currentMethod = currentMethods[activeTarget] ?? null;
   const history = histories[activeTarget] || [];
+
+  // Check if using TCP fallback (not real ICMP)
+  const isTcpFallback = currentMethod && currentMethod !== "Icmp";
 
   return (
     <div className="app">
       {/* Header */}
       <div className="header">
-        <h1 className="title">PingZilla</h1>
-        <button
-          className="settings-btn"
-          onClick={() => setShowSettings(!showSettings)}
-        >
-          {showSettings ? "X" : "Settings"}
-        </button>
+        <h1 className="title">
+          {viewMode === "settings" ? "PingZilla Settings" : "PingZilla"}
+        </h1>
+        {/* Hide settings button in dedicated settings window or dashboard */}
+        {viewMode === "full" && (
+          <button
+            className="settings-btn"
+            onClick={() => setShowSettings(!showSettings)}
+          >
+            {showSettings ? "X" : "Settings"}
+          </button>
+        )}
       </div>
 
       {/* IP Info Bar */}
@@ -563,8 +607,8 @@ function App() {
         </div>
       )}
 
-      {/* Settings Panel */}
-      {showSettings && (
+      {/* Settings Panel - always visible in settings mode, toggleable in full mode */}
+      {(viewMode === "settings" || (viewMode === "full" && showSettings)) && (
         <div className="settings-panel">
           <div className="setting-row">
             <label>Ping target:</label>
@@ -605,6 +649,21 @@ function App() {
             </select>
           </div>
           <div className="setting-row">
+            <label>Ping interval:</label>
+            <select
+              className="display-mode-select"
+              value={pingInterval}
+              onChange={(e) => setPingInterval(parseInt(e.target.value))}
+            >
+              <option value={5}>5 sec</option>
+              <option value={10}>10 sec</option>
+              <option value={15}>15 sec</option>
+              <option value={30}>30 sec</option>
+              <option value={60}>1 min</option>
+              <option value={120}>2 min</option>
+            </select>
+          </div>
+          <div className="setting-row">
             <label>Alert threshold:</label>
             <input
               type="number"
@@ -630,6 +689,9 @@ function App() {
         </div>
       )}
 
+      {/* Main content - hidden in settings mode */}
+      {viewMode !== "settings" && (
+        <>
       {/* Current Ping Display */}
       <div className="current-ping">
         <div
@@ -644,6 +706,11 @@ function App() {
           style={{ color: getPingColor(currentPing) }}
         >
           {getPingStatus(currentPing)}
+          {isTcpFallback && (
+            <span className="tcp-badge" title="Using TCP connect instead of ICMP ping (sandbox mode)">
+              TCP
+            </span>
+          )}
         </div>
       </div>
 
@@ -799,10 +866,14 @@ function App() {
           <div className="site-empty">No sites monitored</div>
         )}
       </div>
+        </>
+      )}
 
       {/* Footer */}
       <div className="footer">
-        <span className="footer-text">Last 2 minutes</span>
+        <span className="footer-text">
+          {viewMode === "settings" ? "PingZilla v1.3.4" : "Last 2 minutes"}
+        </span>
       </div>
     </div>
   );

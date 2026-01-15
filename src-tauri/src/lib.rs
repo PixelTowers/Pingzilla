@@ -9,14 +9,22 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::{
     image::Image,
-    menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State,
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::TrayIconBuilder,
+    AppHandle, Emitter, Manager, State, Wry,
 };
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::Mutex;
 
+/// Method used to measure ping latency
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PingMethod {
+    Icmp,      // Real ICMP ping via system command
+    TcpDns,    // TCP connect to port 53 (DNS)
+    TcpHttps,  // TCP connect to port 443
+    TcpHttp,   // TCP connect to port 80
+}
 
 /// A single ping measurement
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +32,8 @@ pub struct PingResult {
     pub timestamp: DateTime<Utc>,
     pub latency_ms: Option<f64>,
     pub target: String,
+    #[serde(default)]
+    pub method: Option<PingMethod>,
 }
 
 /// Statistics for a target
@@ -171,6 +181,8 @@ pub struct AppState {
     // Battery optimization: sleep/wake and visibility tracking
     pub is_system_sleeping: AtomicBool,
     pub is_window_visible: AtomicBool,
+    // User-configurable ping interval (in seconds)
+    pub ping_interval_secs: Mutex<u32>,
 }
 
 impl Default for AppState {
@@ -199,6 +211,8 @@ impl Default for AppState {
             // Battery optimization defaults
             is_system_sleeping: AtomicBool::new(false),
             is_window_visible: AtomicBool::new(false),
+            // Default ping interval: 10 seconds
+            ping_interval_secs: Mutex::new(10),
         }
     }
 }
@@ -617,6 +631,26 @@ async fn set_window_visible(visible: bool, state: State<'_, Arc<AppState>>) -> R
     Ok(())
 }
 
+/// Get ping interval setting (in seconds)
+#[tauri::command]
+async fn get_ping_interval(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
+    let interval = *state.ping_interval_secs.lock().await;
+    Ok(interval)
+}
+
+/// Set ping interval (in seconds, min 5, max 120)
+#[tauri::command]
+async fn set_ping_interval(interval_secs: u32, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    if interval_secs < 5 {
+        return Err("Ping interval must be at least 5 seconds".to_string());
+    }
+    if interval_secs > 120 {
+        return Err("Ping interval must be at most 120 seconds".to_string());
+    }
+    *state.ping_interval_secs.lock().await = interval_secs;
+    Ok(())
+}
+
 /// Get all site monitors
 #[tauri::command]
 async fn get_site_monitors(state: State<'_, Arc<AppState>>) -> Result<Vec<SiteMonitor>, String> {
@@ -671,6 +705,51 @@ async fn get_site_statuses(
     Ok(statuses.clone())
 }
 
+/// Perform ICMP ping using surge-ping (true ICMP, no root required on macOS)
+/// This uses the non-privileged SOCK_DGRAM + IPPROTO_ICMP socket facility
+async fn do_icmp_ping(target: &str) -> Option<f64> {
+    use std::net::IpAddr;
+    use std::time::Instant;
+    use surge_ping::{Client, Config, PingIdentifier, PingSequence};
+    use tokio::time::timeout;
+
+    // Resolve hostname to IP address
+    let ip: IpAddr = if let Ok(ip) = target.parse() {
+        ip
+    } else {
+        // DNS resolution for hostnames
+        let addrs = tokio::net::lookup_host(format!("{}:0", target))
+            .await
+            .ok()?;
+        addrs.into_iter().next()?.ip()
+    };
+
+    // Generate random identifier before async operations (ThreadRng is not Send)
+    let identifier: u16 = rand::random();
+
+    // Create surge-ping client with default config (tries DGRAM first, then RAW)
+    let client = Client::new(&Config::default()).ok()?;
+    let mut pinger = client.pinger(ip, PingIdentifier(identifier)).await;
+
+    let start = Instant::now();
+
+    // 2-second timeout for the ping itself, 3-second outer timeout
+    match timeout(Duration::from_secs(3), pinger.ping(PingSequence(0), &[])).await {
+        Ok(Ok((_, rtt))) => {
+            // surge-ping returns the round-trip time directly
+            Some(rtt.as_secs_f64() * 1000.0)
+        }
+        _ => {
+            // Log for debugging (optional - helps identify sandbox blocks)
+            let elapsed = start.elapsed();
+            if elapsed > Duration::from_secs(2) {
+                // Timed out - likely sandbox blocking
+            }
+            None
+        }
+    }
+}
+
 /// Perform a TCP connect to measure latency (works in App Sandbox)
 async fn do_tcp_ping(target: &str, port: u16) -> Option<f64> {
     use std::time::Instant;
@@ -692,66 +771,30 @@ async fn do_tcp_ping(target: &str, port: u16) -> Option<f64> {
     }
 }
 
-/// Perform a single ping using system ping command (no root needed)
-/// Uses tokio::process::Command for async execution with timeout to prevent
-/// blocking the runtime if sandbox denies ping execution
-async fn do_system_ping(target: &str) -> Option<f64> {
-    use tokio::process::Command;
-    use tokio::time::timeout;
-
-    // 3-second timeout - if sandbox blocks ping, we move on quickly to TCP fallback
-    let result = timeout(Duration::from_secs(3), async {
-        let output = Command::new("ping")
-            .args(["-c", "1", "-W", "2000", target])
-            .output()
-            .await
-            .ok()?;
-
-        if !output.status.success() {
-            return None;
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        // Parse "time=12.345 ms" from output
-        for line in stdout.lines() {
-            if let Some(time_idx) = line.find("time=") {
-                let time_str = &line[time_idx + 5..];
-                if let Some(ms_idx) = time_str.find(" ms") {
-                    if let Ok(ms) = time_str[..ms_idx].parse::<f64>() {
-                        return Some(ms);
-                    }
-                }
-            }
-        }
-
-        None
-    })
-    .await;
-
-    result.ok().flatten()
-}
-
-/// Perform a ping with automatic fallback to TCP if system ping fails
+/// Perform a ping with automatic fallback to TCP if ICMP ping fails
 /// This ensures the app works in the App Sandbox
-async fn do_ping(target: &str) -> Option<f64> {
-    // Try system ping first (more accurate ICMP timing)
-    if let Some(ms) = do_system_ping(target).await {
-        return Some(ms);
+/// Returns (latency_ms, method_used) tuple
+async fn do_ping(target: &str) -> (Option<f64>, Option<PingMethod>) {
+    // Try surge-ping ICMP first (true ICMP, may work in sandbox via DGRAM socket)
+    if let Some(ms) = do_icmp_ping(target).await {
+        return (Some(ms), Some(PingMethod::Icmp));
     }
 
-    // Fallback to TCP connect measurement (works in sandbox)
+    // Fallback to TCP connect measurement (guaranteed to work in sandbox)
     // Try DNS port first (works for DNS servers like 1.1.1.1)
     if let Some(ms) = do_tcp_ping(target, 53).await {
-        return Some(ms);
+        return (Some(ms), Some(PingMethod::TcpDns));
     }
 
     // Then try HTTPS and HTTP ports (works for web servers)
     if let Some(ms) = do_tcp_ping(target, 443).await {
-        return Some(ms);
+        return (Some(ms), Some(PingMethod::TcpHttps));
     }
 
-    do_tcp_ping(target, 80).await
+    match do_tcp_ping(target, 80).await {
+        Some(ms) => (Some(ms), Some(PingMethod::TcpHttp)),
+        None => (None, None),
+    }
 }
 
 /// Check if a site is up by connecting to it
@@ -1027,11 +1070,12 @@ async fn save_history_async(state: &Arc<AppState>) {
     let primary = state.primary_target.lock().await.clone();
     let site_monitors = state.site_monitors.lock().await.clone();
     let vpn_settings = state.vpn_settings.lock().await.clone();
+    let ping_interval = *state.ping_interval_secs.lock().await;
 
     // Spawn blocking file I/O in a separate thread to not block async runtime
     let _ = tokio::task::spawn_blocking(move || {
         // Ignore error - can't send Box<dyn Error> across threads
-        let _ = save_history(&history, &targets, &primary, &site_monitors, &vpn_settings);
+        let _ = save_history(&history, &targets, &primary, &site_monitors, &vpn_settings, ping_interval);
     })
     .await;
 }
@@ -1069,12 +1113,13 @@ fn start_unified_background_service(app_handle: AppHandle, state: Arc<AppState>)
                 let primary_target = state.primary_target.lock().await.clone();
 
                 for target in &targets {
-                    let latency_ms = do_ping(target).await;
+                    let (latency_ms, method) = do_ping(target).await;
 
                     let result = PingResult {
                         timestamp: Utc::now(),
                         latency_ms,
                         target: target.clone(),
+                        method,
                     };
 
                     {
@@ -1115,6 +1160,15 @@ fn start_unified_background_service(app_handle: AppHandle, state: Arc<AppState>)
                     }
 
                     let _ = app_handle.emit("ping-update", &result);
+
+                    // Rebuild the tray menu with current data (for native menu display)
+                    if target == &primary_target {
+                        if let Some(tray) = app_handle.tray_by_id("main-tray") {
+                            if let Ok(menu) = build_dynamic_menu(&app_handle, &state).await {
+                                let _ = tray.set_menu(Some(menu));
+                            }
+                        }
+                    }
 
                     // Notifications for primary target only
                     if target == &primary_target {
@@ -1164,12 +1218,11 @@ fn start_unified_background_service(app_handle: AppHandle, state: Arc<AppState>)
                 save_history_async(&state).await;
             }
 
-            // === ADAPTIVE INTERVAL: 10s when visible, 30s when hidden ===
-            let is_visible = state.is_window_visible.load(Ordering::Relaxed);
-            let interval_secs = if is_visible { 10 } else { 30 };
-            last_interval_secs = interval_secs;
+            // === PING INTERVAL: use user's configured setting ===
+            let interval_secs = *state.ping_interval_secs.lock().await;
+            last_interval_secs = interval_secs as u64;
 
-            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            tokio::time::sleep(Duration::from_secs(interval_secs as u64)).await;
         }
     });
 }
@@ -1185,6 +1238,12 @@ struct SavedData {
     site_monitors: Vec<SiteMonitor>,
     #[serde(default)]
     vpn_settings: VpnProtectionSettings,
+    #[serde(default = "default_ping_interval")]
+    ping_interval_secs: u32,
+}
+
+fn default_ping_interval() -> u32 {
+    10
 }
 
 /// Save history to disk
@@ -1194,6 +1253,7 @@ fn save_history(
     primary_target: &str,
     site_monitors: &[SiteMonitor],
     vpn_settings: &VpnProtectionSettings,
+    ping_interval_secs: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(data_dir) = dirs::data_dir() {
         let app_dir = data_dir.join("pingzilla");
@@ -1206,6 +1266,7 @@ fn save_history(
             notification_threshold_ms: 400,
             site_monitors: site_monitors.to_vec(),
             vpn_settings: vpn_settings.clone(),
+            ping_interval_secs,
         };
         let json = serde_json::to_string(&data)?;
         std::fs::write(file_path, json)?;
@@ -1214,7 +1275,7 @@ fn save_history(
 }
 
 /// Load history from disk
-fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String, Vec<SiteMonitor>, VpnProtectionSettings) {
+fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String, Vec<SiteMonitor>, VpnProtectionSettings, u32) {
     if let Some(data_dir) = dirs::data_dir() {
         // Try new format first
         let file_path_v2 = data_dir.join("pingzilla").join("history_v2.json");
@@ -1230,7 +1291,7 @@ fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String
                         (target, filtered)
                     })
                     .collect();
-                return (filtered_history, data.targets, data.primary_target, data.site_monitors, data.vpn_settings);
+                return (filtered_history, data.targets, data.primary_target, data.site_monitors, data.vpn_settings, data.ping_interval_secs);
             }
         }
 
@@ -1249,60 +1310,82 @@ fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String
                     .unwrap_or_else(|| "1.1.1.1".to_string());
                 let mut map = HashMap::new();
                 map.insert(target.clone(), filtered);
-                return (map, vec![target.clone()], target, Vec::new(), VpnProtectionSettings::default());
+                return (map, vec![target.clone()], target, Vec::new(), VpnProtectionSettings::default(), 10);
             }
         }
     }
 
     let mut history = HashMap::new();
     history.insert("1.1.1.1".to_string(), VecDeque::new());
-    (history, vec!["1.1.1.1".to_string()], "1.1.1.1".to_string(), Vec::new(), VpnProtectionSettings::default())
-}
-
-/// Position window below tray icon (macOS)
-fn position_window_at_tray(window: &tauri::WebviewWindow, tray_rect: tauri::Rect) {
-    let scale = window.scale_factor().unwrap_or(2.0);
-
-    // Get window size in logical pixels
-    let window_size = window.outer_size().unwrap_or(tauri::PhysicalSize {
-        width: 320,
-        height: 400,
-    });
-    let window_width = (window_size.width as f64 / scale) as i32;
-
-    // Get tray position - the rect gives us physical coordinates
-    let tray_x = match tray_rect.position {
-        tauri::Position::Physical(p) => (p.x as f64 / scale) as i32,
-        tauri::Position::Logical(l) => l.x as i32,
-    };
-    let tray_y = match tray_rect.position {
-        tauri::Position::Physical(p) => (p.y as f64 / scale) as i32,
-        tauri::Position::Logical(l) => l.y as i32,
-    };
-    let tray_width = match tray_rect.size {
-        tauri::Size::Physical(p) => (p.width as f64 / scale) as i32,
-        tauri::Size::Logical(l) => l.width as i32,
-    };
-    let tray_height = match tray_rect.size {
-        tauri::Size::Physical(p) => (p.height as f64 / scale) as i32,
-        tauri::Size::Logical(l) => l.height as i32,
-    };
-
-    // Center window under tray icon
-    let x = tray_x + (tray_width / 2) - (window_width / 2);
-    let y = tray_y + tray_height + 5;
-
-    let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+    (history, vec!["1.1.1.1".to_string()], "1.1.1.1".to_string(), Vec::new(), VpnProtectionSettings::default(), 10)
 }
 
 /// Register for macOS sleep/wake notifications to pause background service during sleep
 /// This is critical for battery optimization - without this, the app drains battery while laptop sleeps
 #[cfg(target_os = "macos")]
-fn register_sleep_wake_observer(_state: Arc<AppState>) {
-    // Note: Full sleep/wake notification requires complex objc2 block setup
-    // For now, the adaptive interval (30s when hidden) provides significant battery savings
-    // The is_system_sleeping flag is available for future implementation
-    // TODO: Implement proper NSWorkspaceWillSleepNotification observer
+fn register_sleep_wake_observer(state: Arc<AppState>) {
+    use block2::StackBlock;
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
+    use objc2_app_kit::NSWorkspace;
+
+    // Spawn a thread to set up the observer and run a run loop
+    std::thread::spawn(move || {
+        unsafe {
+            // Get NSWorkspace and its notification center
+            let workspace = NSWorkspace::sharedWorkspace();
+            let notification_center: *mut AnyObject = msg_send![&*workspace, notificationCenter];
+
+            // Create notification name strings
+            let sleep_name = objc2_foundation::ns_string!("NSWorkspaceWillSleepNotification");
+            let wake_name = objc2_foundation::ns_string!("NSWorkspaceDidWakeNotification");
+
+            // Clone state for sleep block
+            let state_sleep = state.clone();
+            let sleep_block = StackBlock::new(move |_notif: *mut AnyObject| {
+                state_sleep
+                    .is_system_sleeping
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+
+            // Clone state for wake block
+            let state_wake = state.clone();
+            let wake_block = StackBlock::new(move |_notif: *mut AnyObject| {
+                state_wake
+                    .is_system_sleeping
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            });
+
+            // Register observers using addObserverForName:object:queue:usingBlock:
+            // queue: nil means use the posting thread
+            let _: *mut AnyObject = msg_send![
+                notification_center,
+                addObserverForName: &*sleep_name
+                object: std::ptr::null::<AnyObject>()
+                queue: std::ptr::null::<AnyObject>()
+                usingBlock: &sleep_block
+            ];
+
+            let _: *mut AnyObject = msg_send![
+                notification_center,
+                addObserverForName: &*wake_name
+                object: std::ptr::null::<AnyObject>()
+                queue: std::ptr::null::<AnyObject>()
+                usingBlock: &wake_block
+            ];
+
+            // Run the run loop to receive notifications
+            // This is required for the observer blocks to be called
+            let run_loop_class = AnyClass::get("NSRunLoop").unwrap();
+            let current_run_loop: *mut AnyObject = msg_send![run_loop_class, currentRunLoop];
+            let distant_future_class = AnyClass::get("NSDate").unwrap();
+            let distant_future: *mut AnyObject = msg_send![distant_future_class, distantFuture];
+
+            loop {
+                let _: Bool = msg_send![current_run_loop, runMode: objc2_foundation::ns_string!("NSDefaultRunLoopMode") beforeDate: distant_future];
+            }
+        }
+    });
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1339,9 +1422,210 @@ fn disable_app_nap() {
     // No-op on non-macOS platforms
 }
 
+/// Convert country code to flag emoji (e.g., "US" -> "🇺🇸")
+fn country_to_flag(country_code: &str) -> String {
+    if country_code.len() != 2 {
+        return "🌐".to_string();
+    }
+    country_code
+        .to_uppercase()
+        .chars()
+        .map(|c| char::from_u32(0x1F1E6 - 'A' as u32 + c as u32).unwrap_or(c))
+        .collect()
+}
+
+/// Shorten URL for display in menu (e.g., "https://example.com/path" -> "example.com")
+fn shorten_url(url: &str) -> String {
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(url)
+        .to_string()
+}
+
+/// Build initial menu structure (before any ping data is available)
+fn build_initial_menu(app: &AppHandle) -> Result<Menu<Wry>, tauri::Error> {
+    let ping_item = MenuItem::with_id(app, "ping", "⚪ Ping: ---", true, None::<&str>)?;
+    let target_item = MenuItem::with_id(app, "target", "   → loading...", true, None::<&str>)?;
+    let stats_item = MenuItem::with_id(app, "stats", "   ↓-- · ~-- · ↑--", true, None::<&str>)?;
+    let separator1 = PredefinedMenuItem::separator(app)?;
+    let ip_item = MenuItem::with_id(app, "ip", "📍 IP: Loading...", true, None::<&str>)?;
+    let separator2 = PredefinedMenuItem::separator(app)?;
+    let dashboard = MenuItem::with_id(app, "dashboard", "📊 Open Dashboard...", true, None::<&str>)?;
+    let separator3 = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit PingZilla", true, None::<&str>)?;
+
+    Menu::with_items(app, &[
+        &ping_item, &target_item, &stats_item, &separator1,
+        &ip_item, &separator2,
+        &dashboard, &separator3,
+        &quit,
+    ])
+}
+
+/// Build dynamic menu with current ping data
+/// Called after each ping to update the menu with latest info
+async fn build_dynamic_menu(app: &AppHandle, state: &Arc<AppState>) -> Result<Menu<Wry>, tauri::Error> {
+    // Get current data
+    let primary_target = state.primary_target.lock().await.clone();
+    let ip_info = state.ip_info.lock().await.clone();
+    let site_statuses = state.site_statuses.lock().await.clone();
+
+    // Get ping data while holding the lock, then release it
+    let (current_ping, min_ms, avg_ms, max_ms) = {
+        let history = state.ping_history.lock().await;
+        let current_ping = history.get(&primary_target).and_then(|h| h.back()).cloned();
+
+        // Calculate stats from recent history (last 5 minutes)
+        let cutoff = Utc::now() - chrono::Duration::minutes(5);
+        let pings: Vec<f64> = history
+            .get(&primary_target)
+            .map(|h| {
+                h.iter()
+                    .filter(|p| p.timestamp > cutoff)
+                    .filter_map(|p| p.latency_ms)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let stats = if pings.is_empty() {
+            (None, None, None)
+        } else {
+            let min = pings.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = pings.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let avg = pings.iter().sum::<f64>() / pings.len() as f64;
+            (Some(min), Some(avg), Some(max))
+        };
+
+        (current_ping, stats.0, stats.1, stats.2)
+    };
+
+    // Build menu items - info items are enabled (true) so they appear normal, not greyed out
+    // Ping status with quality indicator
+    let (ping_text, status_icon) = match &current_ping {
+        Some(p) => match p.latency_ms {
+            Some(ms) => {
+                let icon = if ms < 50.0 { "🟢" } else if ms < 150.0 { "🟡" } else { "🔴" };
+                (format!("{:.0}ms", ms), icon)
+            },
+            None => ("Timeout".to_string(), "⚫"),
+        },
+        None => ("---".to_string(), "⚪"),
+    };
+    // Add method indicator after ping value if using TCP fallback
+    let method_suffix = match current_ping.as_ref().and_then(|p| p.method.as_ref()) {
+        Some(PingMethod::TcpDns) | Some(PingMethod::TcpHttps) | Some(PingMethod::TcpHttp) => " TCP",
+        _ => "", // ICMP - no indicator needed
+    };
+    let ping_item = MenuItem::with_id(app, "ping", &format!("{} Ping: {}{}", status_icon, ping_text, method_suffix), true, None::<&str>)?;
+
+    // Target line
+    let target_item = MenuItem::with_id(app, "target", &format!("   → {}", primary_target), true, None::<&str>)?;
+
+    // Stats - more compact
+    let stats_text = format!(
+        "   ↓{} · ~{} · ↑{}",
+        min_ms.map(|v| format!("{:.0}ms", v)).unwrap_or_else(|| "--".to_string()),
+        avg_ms.map(|v| format!("{:.0}ms", v)).unwrap_or_else(|| "--".to_string()),
+        max_ms.map(|v| format!("{:.0}ms", v)).unwrap_or_else(|| "--".to_string())
+    );
+    let stats_item = MenuItem::with_id(app, "stats", &stats_text, true, None::<&str>)?;
+
+    let separator1 = PredefinedMenuItem::separator(app)?;
+
+    // IP info
+    let ip_text = match ip_info {
+        Some(info) => {
+            let flag = country_to_flag(&info.country_code);
+            format!("📍 IP: {} ({} {})", info.ip, flag, info.country_code)
+        }
+        None => "📍 IP: Loading...".to_string(),
+    };
+    let ip_item = MenuItem::with_id(app, "ip", &ip_text, true, None::<&str>)?;
+
+    // Site monitors section
+    let mut menu_items: Vec<Box<dyn tauri::menu::IsMenuItem<Wry>>> = vec![
+        Box::new(ping_item),
+        Box::new(target_item),
+        Box::new(stats_item),
+        Box::new(separator1),
+        Box::new(ip_item),
+    ];
+
+    // Add site monitors if any
+    if !site_statuses.is_empty() {
+        let sites_sep = PredefinedMenuItem::separator(app)?;
+        menu_items.push(Box::new(sites_sep));
+
+        let sites_header = MenuItem::with_id(app, "sites_header", "🌐 Sites:", true, None::<&str>)?;
+        menu_items.push(Box::new(sites_header));
+
+        for (url, status) in site_statuses.iter().take(5) {
+            let icon = if status.is_up { "✅" } else { "❌" };
+            let latency = status.latency_ms.map(|ms| format!("({}ms)", ms as i32)).unwrap_or_default();
+            let site_name = shorten_url(url);
+            let text = format!("  {} {} {}", icon, site_name, latency);
+            let site_item = MenuItem::with_id(app, &format!("site_{}", url), &text, true, None::<&str>)?;
+            menu_items.push(Box::new(site_item));
+        }
+    }
+
+    // Action items
+    let separator3 = PredefinedMenuItem::separator(app)?;
+    let dashboard = MenuItem::with_id(app, "dashboard", "📊 Open Dashboard...", true, None::<&str>)?;
+    let separator4 = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit PingZilla", true, None::<&str>)?;
+
+    menu_items.push(Box::new(separator3));
+    menu_items.push(Box::new(dashboard));
+    menu_items.push(Box::new(separator4));
+    menu_items.push(Box::new(quit));
+
+    // Build the menu
+    let item_refs: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = menu_items.iter().map(|b| b.as_ref()).collect();
+    Menu::with_items(app, &item_refs)
+}
+
+/// Open dashboard window with full React UI (graph, stats, etc.)
+/// Creates window on demand to save battery when not in use
+fn open_dashboard_window(app: &AppHandle) {
+    // If window exists, show it
+    if let Some(window) = app.get_webview_window("dashboard") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return;
+    }
+
+    // Create window on demand (saves battery by not running webview until needed)
+    if let Ok(window) = tauri::WebviewWindowBuilder::new(
+        app,
+        "dashboard",
+        tauri::WebviewUrl::App("index.html".into())
+    )
+    .title("PingZilla")
+    .inner_size(400.0, 600.0)
+    .resizable(true)
+    .visible(true)
+    .decorations(true)
+    .center()
+    .build()
+    {
+        // Hide window on close instead of destroying (keeps app running)
+        let win = window.clone();
+        window.on_window_event(move |event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = win.hide();
+            }
+        });
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let (loaded_history, loaded_targets, loaded_primary, loaded_site_monitors, loaded_vpn_settings) = load_history();
+    let (loaded_history, loaded_targets, loaded_primary, loaded_site_monitors, loaded_vpn_settings, loaded_ping_interval) = load_history();
 
     let app_state = Arc::new(AppState {
         ping_history: Mutex::new(loaded_history),
@@ -1349,6 +1633,7 @@ pub fn run() {
         primary_target: Mutex::new(loaded_primary),
         site_monitors: Mutex::new(loaded_site_monitors),
         vpn_settings: Mutex::new(loaded_vpn_settings),
+        ping_interval_secs: Mutex::new(loaded_ping_interval),
         ..Default::default()
     });
 
@@ -1381,14 +1666,16 @@ pub fn run() {
             get_network_stability,
             acknowledge_ip_change,
             set_window_visible,
+            get_ping_interval,
+            set_ping_interval,
         ])
         .setup(move |app| {
             // Show in Dock - required for ping to work in sandboxed App Store builds
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Regular);
 
-            let quit = MenuItem::with_id(app, "quit", "Quit PingZilla", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&quit])?;
+            // Build initial menu (will be updated dynamically on each ping)
+            let initial_menu = build_initial_menu(app.handle())?;
 
             // Start with happy Godzilla icon (will update based on ping latency)
             let icon_bytes = include_bytes!("../icons/pingzilla_happy.png");
@@ -1398,33 +1685,14 @@ pub fn run() {
                 .icon(icon)
                 .icon_as_template(true)
                 .title("...")
-                .tooltip("PingZilla - Network Monitor (Right-click to quit)")
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_tray_icon_event(|tray, event| {
-                    let app = tray.app_handle();
-
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        rect,
-                        ..
-                    } = event
-                    {
-                        if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
-                            } else {
-                                position_window_at_tray(&window, rect);
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                    }
-                })
+                .tooltip("PingZilla - Network Monitor")
+                .menu(&initial_menu)
+                .show_menu_on_left_click(true) // Both left and right click show menu - works in fullscreen!
                 .on_menu_event(|app, event| {
-                    if event.id.as_ref() == "quit" {
-                        app.exit(0);
+                    match event.id.as_ref() {
+                        "dashboard" => open_dashboard_window(app),
+                        "quit" => app.exit(0),
+                        _ => {}
                     }
                 })
                 .build(app)?;
@@ -1436,6 +1704,9 @@ pub fn run() {
             // Single unified background service for battery efficiency
             // Consolidates ping, site monitoring, and VPN check into ONE timer
             start_unified_background_service(app.handle().clone(), app_state.clone());
+
+            // No window at startup - webview is created on demand when user opens dashboard
+            // This saves significant battery by not running Chromium until needed
 
             Ok(())
         })
