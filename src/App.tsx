@@ -4,6 +4,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import {
   LineChart,
@@ -183,6 +184,8 @@ function App() {
   const [showVpnSettings, setShowVpnSettings] = useState(false);
   // Ping interval setting (in seconds)
   const [pingInterval, setPingInterval] = useState(10);
+  // App version from Tauri
+  const [appVersion, setAppVersion] = useState("");
 
   // Load initial data and settings
   useEffect(() => {
@@ -201,6 +204,10 @@ function App() {
 
         const autoStartEnabled = await isEnabled();
         setLaunchAtLogin(autoStartEnabled);
+
+        // Load app version
+        const version = await getVersion();
+        setAppVersion(version);
 
         // Load history for each target
         const newHistories: Record<string, ChartData[]> = {};
@@ -443,7 +450,7 @@ function App() {
     try {
       await invoke("set_notification_threshold", { thresholdMs: threshold });
       await invoke("set_display_mode", { mode: displayMode });
-      await invoke("set_ping_interval", { interval_secs: pingInterval });
+      await invoke("set_ping_interval", { intervalSecs: pingInterval });
       setShowSettings(false);
     } catch (e) {
       console.error("Failed to save settings:", e);
@@ -467,14 +474,14 @@ function App() {
   // Determine ping color based on latency
   const getPingColor = (ms: number | null): string => {
     if (ms === null) return "#888";
-    if (ms < 50) return "#22c55e"; // green
+    if (ms < 100) return "#22c55e"; // green
     if (ms < 150) return "#eab308"; // yellow
     return "#ef4444"; // red
   };
 
   const getPingStatus = (ms: number | null): string => {
     if (ms === null) return "Timeout";
-    if (ms < 50) return "Excellent";
+    if (ms < 100) return "Excellent";
     if (ms < 150) return "Good";
     return "Poor";
   };
@@ -872,7 +879,7 @@ function App() {
       {/* Footer */}
       <div className="footer">
         <span className="footer-text">
-          {viewMode === "settings" ? "PingZilla v1.3.4" : "Last 2 minutes"}
+          {viewMode === "settings" ? `PingZilla v${appVersion}` : `Last 2 minutes · v${appVersion}`}
         </span>
       </div>
     </div>

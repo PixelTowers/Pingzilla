@@ -74,8 +74,8 @@ React (src/App.tsx)
 
 | Latency | Color | Status |
 |---------|-------|--------|
-| < 50ms | Green (#22c55e) | Excellent |
-| 50-150ms | Yellow (#eab308) | Good |
+| < 100ms | Green (#22c55e) | Excellent |
+| 100-150ms | Yellow (#eab308) | Good |
 | > 150ms | Red (#ef4444) | Poor |
 | Timeout | Gray (#888) | No response |
 

@@ -15,15 +15,16 @@ use tauri::{
 };
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_notification::NotificationExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 /// Method used to measure ping latency
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PingMethod {
     Icmp,      // Real ICMP ping via system command
-    TcpDns,    // TCP connect to port 53 (DNS)
-    TcpHttps,  // TCP connect to port 443
-    TcpHttp,   // TCP connect to port 80
+    // TCP variants kept for backwards compatibility with existing history data
+    TcpDns,    // (deprecated) TCP connect to port 53 (DNS)
+    TcpHttps,  // (deprecated) TCP connect to port 443
+    TcpHttp,   // (deprecated) TCP connect to port 80
 }
 
 /// A single ping measurement
@@ -181,6 +182,8 @@ pub struct AppState {
     // Battery optimization: sleep/wake and visibility tracking
     pub is_system_sleeping: AtomicBool,
     pub is_window_visible: AtomicBool,
+    // Notify channel for waking background service after system sleep
+    pub wake_notify: Arc<Notify>,
     // User-configurable ping interval (in seconds)
     pub ping_interval_secs: Mutex<u32>,
 }
@@ -211,6 +214,8 @@ impl Default for AppState {
             // Battery optimization defaults
             is_system_sleeping: AtomicBool::new(false),
             is_window_visible: AtomicBool::new(false),
+            // Notify channel for waking background service after system sleep
+            wake_notify: Arc::new(Notify::new()),
             // Default ping interval: 10 seconds
             ping_interval_secs: Mutex::new(10),
         }
@@ -369,7 +374,7 @@ async fn set_display_mode(
 
         // Choose icon based on latency
         let status_icon = match current_ping {
-            Some(ms) if ms < 60.0 => icon_happy.as_slice(),
+            Some(ms) if ms < 100.0 => icon_happy.as_slice(),
             Some(ms) if ms < 150.0 => icon_angry.as_slice(),
             Some(_) => icon_sad.as_slice(),
             None => icon_dead.as_slice(),
@@ -750,49 +755,11 @@ async fn do_icmp_ping(target: &str) -> Option<f64> {
     }
 }
 
-/// Perform a TCP connect to measure latency (works in App Sandbox)
-async fn do_tcp_ping(target: &str, port: u16) -> Option<f64> {
-    use std::time::Instant;
-    use tokio::net::TcpStream;
-    use tokio::time::timeout;
-
-    // For IP addresses, connect directly. For hostnames, try to resolve first.
-    let addr = if target.parse::<std::net::IpAddr>().is_ok() {
-        format!("{}:{}", target, port)
-    } else {
-        format!("{}:{}", target, port)
-    };
-
-    let start = Instant::now();
-
-    match timeout(Duration::from_secs(2), TcpStream::connect(&addr)).await {
-        Ok(Ok(_stream)) => Some(start.elapsed().as_secs_f64() * 1000.0),
-        _ => None,
-    }
-}
-
-/// Perform a ping with automatic fallback to TCP if ICMP ping fails
-/// This ensures the app works in the App Sandbox
+/// Perform a ping using ICMP only
 /// Returns (latency_ms, method_used) tuple
 async fn do_ping(target: &str) -> (Option<f64>, Option<PingMethod>) {
-    // Try surge-ping ICMP first (true ICMP, may work in sandbox via DGRAM socket)
-    if let Some(ms) = do_icmp_ping(target).await {
-        return (Some(ms), Some(PingMethod::Icmp));
-    }
-
-    // Fallback to TCP connect measurement (guaranteed to work in sandbox)
-    // Try DNS port first (works for DNS servers like 1.1.1.1)
-    if let Some(ms) = do_tcp_ping(target, 53).await {
-        return (Some(ms), Some(PingMethod::TcpDns));
-    }
-
-    // Then try HTTPS and HTTP ports (works for web servers)
-    if let Some(ms) = do_tcp_ping(target, 443).await {
-        return (Some(ms), Some(PingMethod::TcpHttps));
-    }
-
-    match do_tcp_ping(target, 80).await {
-        Some(ms) => (Some(ms), Some(PingMethod::TcpHttp)),
+    match do_icmp_ping(target).await {
+        Some(ms) => (Some(ms), Some(PingMethod::Icmp)),
         None => (None, None),
     }
 }
@@ -995,7 +962,7 @@ async fn check_ip_change(app_handle: &AppHandle, state: &Arc<AppState>) {
 /// Determine which icon type to use based on latency
 fn get_icon_type_for_latency(latency_ms: Option<f64>) -> TrayIconType {
     match latency_ms {
-        Some(ms) if ms < 60.0 => TrayIconType::Happy,
+        Some(ms) if ms < 100.0 => TrayIconType::Happy,
         Some(ms) if ms < 150.0 => TrayIconType::Angry,
         Some(_) => TrayIconType::Sad,
         None => TrayIconType::Dead,
@@ -1098,10 +1065,10 @@ fn start_unified_background_service(app_handle: AppHandle, state: Arc<AppState>)
         };
 
         loop {
-            // === SLEEP CHECK: Skip all work if system is sleeping ===
+            // === SLEEP CHECK: Block until wake if system is sleeping ===
             if state.is_system_sleeping.load(Ordering::Relaxed) {
-                // Wait briefly and check again - don't do any work
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                // Block until wake notification - ZERO CPU usage during sleep
+                state.wake_notify.notified().await;
                 continue;
             }
 
@@ -1321,104 +1288,70 @@ fn load_history() -> (HashMap<String, VecDeque<PingResult>>, Vec<String>, String
 }
 
 /// Register for macOS sleep/wake notifications to pause background service during sleep
-/// This is critical for battery optimization - without this, the app drains battery while laptop sleeps
+/// This is critical for battery optimization - no separate thread needed
 #[cfg(target_os = "macos")]
 fn register_sleep_wake_observer(state: Arc<AppState>) {
-    use block2::StackBlock;
+    use block2::RcBlock;
     use objc2::msg_send;
-    use objc2::runtime::{AnyClass, AnyObject, Bool};
+    use objc2::runtime::AnyObject;
     use objc2_app_kit::NSWorkspace;
 
-    // Spawn a thread to set up the observer and run a run loop
-    std::thread::spawn(move || {
-        unsafe {
-            // Get NSWorkspace and its notification center
-            let workspace = NSWorkspace::sharedWorkspace();
-            let notification_center: *mut AnyObject = msg_send![&*workspace, notificationCenter];
-
-            // Create notification name strings
-            let sleep_name = objc2_foundation::ns_string!("NSWorkspaceWillSleepNotification");
-            let wake_name = objc2_foundation::ns_string!("NSWorkspaceDidWakeNotification");
-
-            // Clone state for sleep block
-            let state_sleep = state.clone();
-            let sleep_block = StackBlock::new(move |_notif: *mut AnyObject| {
-                state_sleep
-                    .is_system_sleeping
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            });
-
-            // Clone state for wake block
-            let state_wake = state.clone();
-            let wake_block = StackBlock::new(move |_notif: *mut AnyObject| {
-                state_wake
-                    .is_system_sleeping
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            });
-
-            // Register observers using addObserverForName:object:queue:usingBlock:
-            // queue: nil means use the posting thread
-            let _: *mut AnyObject = msg_send![
-                notification_center,
-                addObserverForName: &*sleep_name
-                object: std::ptr::null::<AnyObject>()
-                queue: std::ptr::null::<AnyObject>()
-                usingBlock: &sleep_block
-            ];
-
-            let _: *mut AnyObject = msg_send![
-                notification_center,
-                addObserverForName: &*wake_name
-                object: std::ptr::null::<AnyObject>()
-                queue: std::ptr::null::<AnyObject>()
-                usingBlock: &wake_block
-            ];
-
-            // Run the run loop to receive notifications
-            // This is required for the observer blocks to be called
-            let run_loop_class = AnyClass::get("NSRunLoop").unwrap();
-            let current_run_loop: *mut AnyObject = msg_send![run_loop_class, currentRunLoop];
-            let distant_future_class = AnyClass::get("NSDate").unwrap();
-            let distant_future: *mut AnyObject = msg_send![distant_future_class, distantFuture];
-
-            loop {
-                let _: Bool = msg_send![current_run_loop, runMode: objc2_foundation::ns_string!("NSDefaultRunLoopMode") beforeDate: distant_future];
-            }
-        }
-    });
-}
-
-#[cfg(not(target_os = "macos"))]
-fn register_sleep_wake_observer(_state: Arc<AppState>) {
-    // No-op on non-macOS platforms
-}
-
-/// Disable App Nap for consistent timer behavior
-/// Without this, macOS throttles background apps, making timers unreliable
-#[cfg(target_os = "macos")]
-fn disable_app_nap() {
-    use objc2::msg_send;
-    use objc2::runtime::AnyClass;
-    use objc2_foundation::NSActivityOptions;
-
     unsafe {
-        // Get NSProcessInfo class
-        let process_info_class = AnyClass::get("NSProcessInfo").unwrap();
-        let process_info: *mut objc2::runtime::AnyObject = msg_send![process_info_class, processInfo];
+        // Get NSWorkspace and its notification center
+        let workspace = NSWorkspace::sharedWorkspace();
+        let notification_center: *mut AnyObject = msg_send![&*workspace, notificationCenter];
 
-        // Create the reason string
-        let reason_str = objc2_foundation::ns_string!("Network monitoring service");
+        // Create notification name strings
+        let sleep_name = objc2_foundation::ns_string!("NSWorkspaceWillSleepNotification");
+        let wake_name = objc2_foundation::ns_string!("NSWorkspaceDidWakeNotification");
 
-        // NSActivityUserInitiatedAllowingIdleSystemSleep = 0x00FFFFF
-        // This tells macOS: "I'm doing important work, don't throttle me, but you can still sleep"
-        let options = NSActivityOptions(0x00FFFFF);
+        // Clone state for sleep block - uses RcBlock for heap allocation (lives forever)
+        let state_sleep = state.clone();
+        let sleep_block = RcBlock::new(move |_notif: *mut AnyObject| {
+            state_sleep
+                .is_system_sleeping
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        });
 
-        let _: *mut objc2::runtime::AnyObject = msg_send![process_info, beginActivityWithOptions:options reason:reason_str];
+        // Clone state for wake block
+        let state_wake = state.clone();
+        let wake_notify = state.wake_notify.clone();
+        let wake_block = RcBlock::new(move |_notif: *mut AnyObject| {
+            state_wake
+                .is_system_sleeping
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // Wake up the background service that's waiting
+            wake_notify.notify_waiters();
+        });
+
+        // Register observers using addObserverForName:object:queue:usingBlock:
+        // queue: nil delivers on posting thread (system's notification thread)
+        // This is safe since we only do atomic operations and notify
+        let _: *mut AnyObject = msg_send![
+            notification_center,
+            addObserverForName: &*sleep_name
+            object: std::ptr::null::<AnyObject>()
+            queue: std::ptr::null::<AnyObject>()
+            usingBlock: &*sleep_block
+        ];
+
+        let _: *mut AnyObject = msg_send![
+            notification_center,
+            addObserverForName: &*wake_name
+            object: std::ptr::null::<AnyObject>()
+            queue: std::ptr::null::<AnyObject>()
+            usingBlock: &*wake_block
+        ];
+
+        // Leak the blocks so they live for the app's lifetime
+        // This is intentional - they need to stay alive to receive notifications
+        std::mem::forget(sleep_block);
+        std::mem::forget(wake_block);
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn disable_app_nap() {
+fn register_sleep_wake_observer(_state: Arc<AppState>) {
     // No-op on non-macOS platforms
 }
 
@@ -1506,19 +1439,14 @@ async fn build_dynamic_menu(app: &AppHandle, state: &Arc<AppState>) -> Result<Me
     let (ping_text, status_icon) = match &current_ping {
         Some(p) => match p.latency_ms {
             Some(ms) => {
-                let icon = if ms < 50.0 { "🟢" } else if ms < 150.0 { "🟡" } else { "🔴" };
+                let icon = if ms < 100.0 { "🟢" } else if ms < 150.0 { "🟡" } else { "🔴" };
                 (format!("{:.0}ms", ms), icon)
             },
             None => ("Timeout".to_string(), "⚫"),
         },
         None => ("---".to_string(), "⚪"),
     };
-    // Add method indicator after ping value if using TCP fallback
-    let method_suffix = match current_ping.as_ref().and_then(|p| p.method.as_ref()) {
-        Some(PingMethod::TcpDns) | Some(PingMethod::TcpHttps) | Some(PingMethod::TcpHttp) => " TCP",
-        _ => "", // ICMP - no indicator needed
-    };
-    let ping_item = MenuItem::with_id(app, "ping", &format!("{} Ping: {}{}", status_icon, ping_text, method_suffix), true, None::<&str>)?;
+    let ping_item = MenuItem::with_id(app, "ping", &format!("{} Ping: {}", status_icon, ping_text), true, None::<&str>)?;
 
     // Target line
     let target_item = MenuItem::with_id(app, "target", &format!("   → {}", primary_target), true, None::<&str>)?;
@@ -1697,8 +1625,8 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Battery optimizations: disable App Nap and register for sleep/wake
-            disable_app_nap();
+            // Battery optimization: register for sleep/wake notifications
+            // App Nap is allowed - macOS will manage power normally
             register_sleep_wake_observer(app_state.clone());
 
             // Single unified background service for battery efficiency
